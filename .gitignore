@@ -1,0 +1,5 @@
+claude-stream-api
+claude-openai-api
+bin
+*.out
+*.log
