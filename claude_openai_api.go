@@ -894,6 +894,34 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 	var streamDeltaSent bool // true if we've sent any stream_event deltas
 	seenToolNames := map[string]bool{} // deduplicate tool_call chunks across both detection paths
 
+	// Aggregated logging: accumulate chunks of the same event type and flush on type change
+	var aggType string      // current aggregated event type (e.g. "text_delta", "thinking_delta")
+	var aggBuf strings.Builder // accumulated text content
+	var aggCount int         // number of chunks aggregated
+
+	flushAggLog := func() {
+		if aggCount == 0 {
+			return
+		}
+		preview := aggBuf.String()
+		if len(preview) > 500 {
+			preview = preview[:500] + "..."
+		}
+		log.Printf("[STREAM %s] chunks=%d len=%d content=%q", strings.ToUpper(aggType), aggCount, aggBuf.Len(), preview)
+		aggType = ""
+		aggBuf.Reset()
+		aggCount = 0
+	}
+
+	aggAppend := func(evtType string, text string) {
+		if evtType != aggType {
+			flushAggLog()
+			aggType = evtType
+		}
+		aggBuf.WriteString(text)
+		aggCount++
+	}
+
 	scanner := bufio.NewScanner(stdout)
 	const maxCapacity = 1024 * 1024
 	buf := make([]byte, maxCapacity)
@@ -904,8 +932,6 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 		if line == "" {
 			continue
 		}
-
-		log.Printf("[STREAM RAW] %s", line)
 
 		var event ClaudeEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
@@ -923,6 +949,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 			if streamEvt.Type == "content_block_start" && streamEvt.ContentBlock != nil {
 				var block StreamContentBlock
 				if err := json.Unmarshal(streamEvt.ContentBlock, &block); err == nil && block.Type == "tool_use" && block.Name != "" {
+					flushAggLog()
 					log.Printf("[STREAM TOOL_USE] name=%s id=%s", block.Name, block.ID)
 					seenToolNames[block.Name] = true
 					tc := ToolCall{
@@ -946,7 +973,6 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 						},
 					}
 					data, _ := json.Marshal(chunk)
-					log.Printf("[SSE TOOL_USE] data=%s", data)
 					fmt.Fprintf(w, "data: %s\n\n", data)
 					flusher.Flush()
 				}
@@ -958,7 +984,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 				}
 				if delta.Type == "text_delta" && delta.Text != "" {
 					streamDeltaSent = true
-					log.Printf("[STREAM DELTA] len=%d content=%q", len(delta.Text), truncate(delta.Text, 200))
+					aggAppend("text_delta", delta.Text)
 
 					chunk := ChatCompletionResponse{
 						ID:      chatID,
@@ -978,7 +1004,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 					flusher.Flush()
 				}
 				if delta.Type == "thinking_delta" && delta.Thinking != "" {
-					log.Printf("[STREAM THINKING] len=%d", len(delta.Thinking))
+					aggAppend("thinking_delta", delta.Thinking)
 					chunk := ChatCompletionResponse{
 						ID:      chatID,
 						Object:  "chat.completion.chunk",
@@ -994,12 +1020,14 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 					}
 					data, _ := json.Marshal(chunk)
 					fmt.Fprintf(w, "data: %s\n\n", data)
-					log.Printf("[SSE THINKING] data=%s", data)
 					flusher.Flush()
 				}
 			}
 			continue
 		}
+
+		// Non-delta event: flush aggregated log before processing
+		flushAggLog()
 
 		// Fallback: extract tool_use and text from assistant summary events.
 		// Handles the case where content_block_start stream events were absent
@@ -1106,6 +1134,8 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 			}
 		}
 	}
+
+	flushAggLog() // flush any remaining aggregated log
 
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
