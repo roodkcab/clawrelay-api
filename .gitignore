@@ -1,5 +1,7 @@
 claude-stream-api
 claude-openai-api
+claude_openai_api
+clawrelay-api
 bin
 *.out
 *.log
