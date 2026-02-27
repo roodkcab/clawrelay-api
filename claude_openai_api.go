@@ -34,6 +34,7 @@ type ChatCompletionRequest struct {
 	WorkingDir    string            `json:"working_dir,omitempty"`
 	EnvVars       map[string]string `json:"env_vars,omitempty"`
 	MaxTurns      *int              `json:"max_turns,omitempty"`
+	SessionID     string            `json:"session_id,omitempty"`
 }
 
 type StreamOptions struct {
@@ -384,6 +385,7 @@ func buildToolPrompt(tools []Tool) string {
 }
 
 var toolCallRe = regexp.MustCompile(`(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>`)
+
 
 // parseToolCalls extracts <tool_call> blocks from text.
 // Returns the remaining clean text and parsed tool calls.
@@ -741,6 +743,10 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	args = append(args, "--max-turns", fmt.Sprintf("%d", maxTurns))
 
+	if req.SessionID != "" {
+		args = append(args, "--resume", req.SessionID)
+	}
+
 	log.Printf("Claude args: %v (prompt length: %d bytes via stdin)", args, len(prompt))
 
 	includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
@@ -775,8 +781,33 @@ func cleanEnv(extra map[string]string) []string {
 	return env
 }
 
-// runClaude starts a claude process and collects its output events.
-func runClaude(args []string, prompt string, workingDir string, envVars map[string]string) (events []ClaudeEvent, lastText string, result string, usage *UsageInfo, err error) {
+// hasArg returns true if flag appears in args.
+func hasArg(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag {
+			return true
+		}
+	}
+	return false
+}
+
+// replaceArg replaces the first occurrence of old with new in a copy of args.
+func replaceArg(args []string, old, new string) []string {
+	result := make([]string, len(args))
+	copy(result, args)
+	for i, a := range result {
+		if a == old {
+			result[i] = new
+			break
+		}
+	}
+	return result
+}
+
+// launchClaude starts a claude process and returns:
+//   - lines: a channel of stdout lines (closed on EOF after cmd.Wait)
+//   - sessErrCh: receives true after stderr is fully consumed if "No conversation found" was seen
+func launchClaude(args []string, prompt string, workingDir string, envVars map[string]string) (<-chan string, <-chan bool, error) {
 	cmd := exec.Command("claude", args...)
 	cmd.Env = cleanEnv(envVars)
 	if workingDir != "" {
@@ -784,40 +815,175 @@ func runClaude(args []string, prompt string, workingDir string, envVars map[stri
 	}
 	cmd.Stdin = strings.NewReader(prompt)
 
-	stdout, err := cmd.StdoutPipe()
+	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, "", "", nil, fmt.Errorf("failed to create pipe: %v", err)
+		return nil, nil, fmt.Errorf("failed to create stdout pipe: %v", err)
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, "", "", nil, fmt.Errorf("failed to create stderr pipe: %v", err)
+		return nil, nil, fmt.Errorf("failed to create stderr pipe: %v", err)
 	}
-
 	if err := cmd.Start(); err != nil {
-		return nil, "", "", nil, fmt.Errorf("failed to start claude: %v", err)
+		return nil, nil, fmt.Errorf("failed to start claude: %v", err)
 	}
 
+	sessErrCh := make(chan bool, 1)
+	var stderrDone sync.WaitGroup
+	stderrDone.Add(1)
 	go func() {
-		scanner := bufio.NewScanner(stderrPipe)
-		for scanner.Scan() {
-			log.Printf("Claude stderr: %s", scanner.Text())
+		defer stderrDone.Done()
+		s := bufio.NewScanner(stderrPipe)
+		found := false
+		for s.Scan() {
+			line := s.Text()
+			log.Printf("Claude stderr: %s", line)
+			if strings.Contains(line, "No conversation found with session ID") {
+				found = true
+			}
+		}
+		sessErrCh <- found
+	}()
+
+	lines := make(chan string, 128)
+	go func() {
+		defer close(lines)
+		s := bufio.NewScanner(stdoutPipe)
+		s.Buffer(make([]byte, 1024*1024), 1024*1024)
+		for s.Scan() {
+			lines <- s.Text()
+		}
+		stderrDone.Wait()
+		if err := cmd.Wait(); err != nil {
+			log.Printf("Claude command error: %v", err)
 		}
 	}()
 
-	scanner := bufio.NewScanner(stdout)
-	const maxCapacity = 1024 * 1024
-	buf := make([]byte, maxCapacity)
-	scanner.Buffer(buf, maxCapacity)
+	return lines, sessErrCh, nil
+}
 
-	for scanner.Scan() {
-		line := scanner.Text()
+// startClaudeStream starts claude with session-retry support.
+// If --resume fails (no output, or only init/system/result events with no real
+// content), it retries with --session-id.
+// Sends nil on ready when it is safe to write HTTP response headers; sends an
+// error if the process could not be started. After ready, read lines from the
+// returned channel until it is closed.
+func startClaudeStream(args []string, prompt string, workingDir string, envVars map[string]string) (<-chan string, <-chan error) {
+	lines := make(chan string, 128)
+	ready := make(chan error, 1)
+
+	go func() {
+		defer close(lines)
+
+		innerLines, sessErrCh, err := launchClaude(args, prompt, workingDir, envVars)
+		if err != nil {
+			ready <- err
+			return
+		}
+
+		if hasArg(args, "--resume") {
+			// Buffer early events to detect failed --resume before committing.
+			// A failed resume typically emits only init/system/result events
+			// (with 0 tokens) then exits. A successful one emits assistant or
+			// stream_event events with real content.
+			var buffered []string
+			gotContent := false
+			shouldRetry := false
+
+			for line := range innerLines {
+				buffered = append(buffered, line)
+				var evt struct {
+					Type string `json:"type"`
+				}
+				if json.Unmarshal([]byte(line), &evt) != nil {
+					continue
+				}
+				if evt.Type == "init" || evt.Type == "system" {
+					continue
+				}
+				if evt.Type == "result" {
+					// result as first content event = failed session
+					shouldRetry = true
+					for range innerLines {
+					} // drain
+					break
+				}
+				// Got real content (assistant, stream_event, etc.)
+				gotContent = true
+				break
+			}
+
+			if !gotContent && !shouldRetry {
+				// Channel closed with only init/system events or no events
+				shouldRetry = true
+			}
+
+			if shouldRetry {
+				<-sessErrCh
+				log.Printf("Resume produced no content, retrying with --session-id")
+				retryArgs := replaceArg(args, "--resume", "--session-id")
+				innerLines, sessErrCh, err = launchClaude(retryArgs, prompt, workingDir, envVars)
+				if err != nil {
+					ready <- err
+					return
+				}
+				go func() { <-sessErrCh }()
+
+				firstLine, ok := <-innerLines
+				ready <- nil
+				if ok {
+					lines <- firstLine
+					for line := range innerLines {
+						lines <- line
+					}
+				}
+				return
+			}
+
+			// No retry — forward buffered lines and remaining
+			go func() { <-sessErrCh }()
+			ready <- nil
+			for _, line := range buffered {
+				lines <- line
+			}
+			for line := range innerLines {
+				lines <- line
+			}
+			return
+		}
+
+		// No --resume: original behavior
+		firstLine, ok := <-innerLines
+		if !ok {
+			go func() { <-sessErrCh }()
+			ready <- nil
+			return
+		}
+		go func() { <-sessErrCh }()
+		ready <- nil
+		lines <- firstLine
+		for line := range innerLines {
+			lines <- line
+		}
+	}()
+
+	return lines, ready
+}
+
+// runClaude starts a claude process and collects its output events.
+func runClaude(args []string, prompt string, workingDir string, envVars map[string]string) (events []ClaudeEvent, lastText string, result string, usage *UsageInfo, err error) {
+	lines, sessErrCh, err := launchClaude(args, prompt, workingDir, envVars)
+	if err != nil {
+		return
+	}
+
+	for line := range lines {
 		if line == "" {
 			continue
 		}
 		log.Printf("[CLAUDE RAW] %s", line)
 		var event ClaudeEvent
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			log.Printf("Failed to parse claude event: %v", err)
+		if jsonErr := json.Unmarshal([]byte(line), &event); jsonErr != nil {
+			log.Printf("Failed to parse claude event: %v", jsonErr)
 			continue
 		}
 		events = append(events, event)
@@ -836,45 +1002,24 @@ func runClaude(args []string, prompt string, workingDir string, envVars map[stri
 		}
 	}
 
-	if scanErr := scanner.Err(); scanErr != nil {
-		log.Printf("Scanner error: %v", scanErr)
-	}
-	if waitErr := cmd.Wait(); waitErr != nil {
-		log.Printf("Claude command error: %v", waitErr)
+	// If --resume produced no real content, retry with --session-id.
+	// A failed resume may still emit init/system/result events with 0 tokens.
+	<-sessErrCh
+	if hasArg(args, "--resume") && lastText == "" && result == "" {
+		log.Printf("Resume produced no content, retrying with --session-id")
+		retryArgs := replaceArg(args, "--resume", "--session-id")
+		return runClaude(retryArgs, prompt, workingDir, envVars)
 	}
 	return
 }
 
 // handleStreamResponse streams text output without tool call detection (fast path).
 func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, includeUsage bool, workingDir string, envVars map[string]string) {
-	cmd := exec.Command("claude", args...)
-	cmd.Env = cleanEnv(envVars)
-	if workingDir != "" {
-		cmd.Dir = workingDir
-	}
-	cmd.Stdin = strings.NewReader(prompt)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		writeOAIError(w, http.StatusInternalServerError, "server_error", fmt.Sprintf("Failed to create pipe: %v", err))
+	lines, ready := startClaudeStream(args, prompt, workingDir, envVars)
+	if err := <-ready; err != nil {
+		writeOAIError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		writeOAIError(w, http.StatusInternalServerError, "server_error", fmt.Sprintf("Failed to create stderr pipe: %v", err))
-		return
-	}
-
-	if err := cmd.Start(); err != nil {
-		writeOAIError(w, http.StatusInternalServerError, "server_error", fmt.Sprintf("Failed to start claude: %v", err))
-		return
-	}
-
-	go func() {
-		scanner := bufio.NewScanner(stderrPipe)
-		for scanner.Scan() {
-			log.Printf("Claude stderr: %s", scanner.Text())
-		}
-	}()
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -922,13 +1067,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 		aggCount++
 	}
 
-	scanner := bufio.NewScanner(stdout)
-	const maxCapacity = 1024 * 1024
-	buf := make([]byte, maxCapacity)
-	scanner.Buffer(buf, maxCapacity)
-
-	for scanner.Scan() {
-		line := scanner.Text()
+	for line := range lines {
 		if line == "" {
 			continue
 		}
@@ -1139,47 +1278,17 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
-
-	if err := scanner.Err(); err != nil {
-		log.Printf("Scanner error: %v", err)
-	}
-	if err := cmd.Wait(); err != nil {
-		log.Printf("Claude command error: %v", err)
-	}
 }
 
 // handleBufferedStreamResponse streams text deltas in real-time while also
 // collecting full text to detect tool calls at the end.
 // Used when tools are defined in the request.
 func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, includeUsage bool, workingDir string, envVars map[string]string) {
-	cmd := exec.Command("claude", args...)
-	cmd.Env = cleanEnv(envVars)
-	if workingDir != "" {
-		cmd.Dir = workingDir
-	}
-	cmd.Stdin = strings.NewReader(prompt)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		writeOAIError(w, http.StatusInternalServerError, "server_error", fmt.Sprintf("Failed to create pipe: %v", err))
+	lines, ready := startClaudeStream(args, prompt, workingDir, envVars)
+	if err := <-ready; err != nil {
+		writeOAIError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		writeOAIError(w, http.StatusInternalServerError, "server_error", fmt.Sprintf("Failed to create stderr pipe: %v", err))
-		return
-	}
-
-	if err := cmd.Start(); err != nil {
-		writeOAIError(w, http.StatusInternalServerError, "server_error", fmt.Sprintf("Failed to start claude: %v", err))
-		return
-	}
-
-	go func() {
-		scanner := bufio.NewScanner(stderrPipe)
-		for scanner.Scan() {
-			log.Printf("Claude stderr: %s", scanner.Text())
-		}
-	}()
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1207,13 +1316,7 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 	nativeTCs := map[int]*nativeToolCall{}
 	var nativeTCOrder []int
 
-	scanner := bufio.NewScanner(stdout)
-	const maxCapacity = 1024 * 1024
-	buf := make([]byte, maxCapacity)
-	scanner.Buffer(buf, maxCapacity)
-
-	for scanner.Scan() {
-		line := scanner.Text()
+	for line := range lines {
 		if line == "" {
 			continue
 		}
@@ -1331,13 +1434,6 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 					event.Usage.CacheReadInputTokens, event.Usage.CacheCreationInputTokens)
 			}
 		}
-	}
-
-	if scanErr := scanner.Err(); scanErr != nil {
-		log.Printf("Scanner error: %v", scanErr)
-	}
-	if waitErr := cmd.Wait(); waitErr != nil {
-		log.Printf("Claude command error: %v", waitErr)
 	}
 
 	// Flush any remaining buffered text from the filter
