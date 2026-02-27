@@ -1,7 +1,6 @@
 claude-stream-api
 claude-openai-api
 claude_openai_api
-claude_openai_api.go
 bin
 *.out
 *.log
