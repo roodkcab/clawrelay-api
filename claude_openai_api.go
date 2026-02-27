@@ -31,7 +31,9 @@ type ChatCompletionRequest struct {
 	Stop          json.RawMessage `json:"stop,omitempty"`
 	Tools         []Tool          `json:"tools,omitempty"`
 	ToolChoice    json.RawMessage `json:"tool_choice,omitempty"`
-	WorkingDir    string          `json:"working_dir,omitempty"`
+	WorkingDir    string            `json:"working_dir,omitempty"`
+	EnvVars       map[string]string `json:"env_vars,omitempty"`
+	MaxTurns      *int              `json:"max_turns,omitempty"`
 }
 
 type StreamOptions struct {
@@ -733,45 +735,50 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	args = append(args, "--include-partial-messages")
 	args = append(args, "--permission-mode", "bypassPermissions")
 
-	// Always limit to 1 turn — our proxy is stateless and tool execution
-	// is managed by the caller (OpenClaw). Prevents Claude from using its
-	// own built-in tools (Bash, Read, Write, etc.) which leak as text.
-	args = append(args, "--max-turns", "0")
+	maxTurns := 200
+	if req.MaxTurns != nil {
+		maxTurns = *req.MaxTurns
+	}
+	args = append(args, "--max-turns", fmt.Sprintf("%d", maxTurns))
 
 	log.Printf("Claude args: %v (prompt length: %d bytes via stdin)", args, len(prompt))
 
 	includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
 
 	workingDir := req.WorkingDir
+	envVars := req.EnvVars
 
 	if req.Stream {
 		if hasTools {
 			// Buffer output to properly detect and format tool calls
-			handleBufferedStreamResponse(w, r, args, prompt, chatID, created, model, includeUsage, workingDir)
+			handleBufferedStreamResponse(w, r, args, prompt, chatID, created, model, includeUsage, workingDir, envVars)
 		} else {
-			handleStreamResponse(w, r, args, prompt, chatID, created, model, includeUsage, workingDir)
+			handleStreamResponse(w, r, args, prompt, chatID, created, model, includeUsage, workingDir, envVars)
 		}
 	} else {
-		handleNonStreamResponse(w, r, args, prompt, chatID, created, model, hasTools, workingDir)
+		handleNonStreamResponse(w, r, args, prompt, chatID, created, model, hasTools, workingDir, envVars)
 	}
 }
 
 // cleanEnv returns the current environment with CLAUDECODE removed,
-// so claude CLI doesn't refuse to run inside another session.
-func cleanEnv() []string {
+// plus any extra KEY=VALUE pairs from the request.
+func cleanEnv(extra map[string]string) []string {
 	var env []string
 	for _, e := range os.Environ() {
 		if !strings.HasPrefix(e, "CLAUDECODE=") {
 			env = append(env, e)
 		}
 	}
+	for k, v := range extra {
+		env = append(env, k+"="+v)
+	}
 	return env
 }
 
 // runClaude starts a claude process and collects its output events.
-func runClaude(args []string, prompt string, workingDir string) (events []ClaudeEvent, lastText string, result string, usage *UsageInfo, err error) {
+func runClaude(args []string, prompt string, workingDir string, envVars map[string]string) (events []ClaudeEvent, lastText string, result string, usage *UsageInfo, err error) {
 	cmd := exec.Command("claude", args...)
-	cmd.Env = cleanEnv()
+	cmd.Env = cleanEnv(envVars)
 	if workingDir != "" {
 		cmd.Dir = workingDir
 	}
@@ -839,9 +846,9 @@ func runClaude(args []string, prompt string, workingDir string) (events []Claude
 }
 
 // handleStreamResponse streams text output without tool call detection (fast path).
-func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, includeUsage bool, workingDir string) {
+func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, includeUsage bool, workingDir string, envVars map[string]string) {
 	cmd := exec.Command("claude", args...)
-	cmd.Env = cleanEnv()
+	cmd.Env = cleanEnv(envVars)
 	if workingDir != "" {
 		cmd.Dir = workingDir
 	}
@@ -1114,9 +1121,9 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 // handleBufferedStreamResponse streams text deltas in real-time while also
 // collecting full text to detect tool calls at the end.
 // Used when tools are defined in the request.
-func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, includeUsage bool, workingDir string) {
+func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, includeUsage bool, workingDir string, envVars map[string]string) {
 	cmd := exec.Command("claude", args...)
-	cmd.Env = cleanEnv()
+	cmd.Env = cleanEnv(envVars)
 	if workingDir != "" {
 		cmd.Dir = workingDir
 	}
@@ -1418,8 +1425,8 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 	flusher.Flush()
 }
 
-func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, hasTools bool, workingDir string) {
-	events, lastText, result, usage, err := runClaude(args, prompt, workingDir)
+func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, hasTools bool, workingDir string, envVars map[string]string) {
+	events, lastText, result, usage, err := runClaude(args, prompt, workingDir, envVars)
 	if err != nil {
 		writeOAIError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
