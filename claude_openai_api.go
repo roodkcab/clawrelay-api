@@ -439,7 +439,7 @@ func extractNativeToolCalls(events []ClaudeEvent) []ToolCall {
 			continue
 		}
 		for _, c := range msg.Content {
-			if c.Type == "tool_use" && c.Name != "" {
+			if c.Type == "tool_use" && c.Name != "" && c.Name != "AskUserQuestion" {
 				args := "{}"
 				if c.Input != nil {
 					args = string(c.Input)
@@ -456,6 +456,37 @@ func extractNativeToolCalls(events []ClaudeEvent) []ToolCall {
 		}
 	}
 	return toolCalls
+}
+
+// extractAskUserQuestionCalls extracts AskUserQuestion tool_use blocks from events.
+func extractAskUserQuestionCalls(events []ClaudeEvent) []ToolCall {
+	var calls []ToolCall
+	for _, event := range events {
+		if event.Type != "assistant" || event.Message == nil {
+			continue
+		}
+		var msg ClaudeMessage
+		if err := json.Unmarshal(event.Message, &msg); err != nil {
+			continue
+		}
+		for _, c := range msg.Content {
+			if c.Type == "tool_use" && c.Name == "AskUserQuestion" {
+				args := "{}"
+				if c.Input != nil {
+					args = string(c.Input)
+				}
+				calls = append(calls, ToolCall{
+					ID:   generateToolCallID(),
+					Type: "function",
+					Function: ToolCallFunction{
+						Name:      "AskUserQuestion",
+						Arguments: args,
+					},
+				})
+			}
+		}
+	}
+	return calls
 }
 
 // toolCallFilter intercepts streaming text to prevent <tool_call>...</tool_call>
@@ -732,10 +763,11 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		args = append(args, "--system-prompt", systemPrompt)
 	}
 	args = append(args, "--model", model)
+	args = append(args, "--betas", "context-1m-2025-08-07")
 	args = append(args, "--verbose")
 	args = append(args, "--output-format", "stream-json")
 	args = append(args, "--include-partial-messages")
-	args = append(args, "--permission-mode", "bypassPermissions")
+	args = append(args, "--permission-mode", "acceptEdits")
 
 	maxTurns := 200
 	if req.MaxTurns != nil {
@@ -805,9 +837,10 @@ func replaceArg(args []string, old, new string) []string {
 }
 
 // launchClaude starts a claude process and returns:
+//   - cmd: the exec.Cmd (caller can kill it to abort early)
 //   - lines: a channel of stdout lines (closed on EOF after cmd.Wait)
 //   - sessErrCh: receives true after stderr is fully consumed if "No conversation found" was seen
-func launchClaude(args []string, prompt string, workingDir string, envVars map[string]string) (<-chan string, <-chan bool, error) {
+func launchClaude(args []string, prompt string, workingDir string, envVars map[string]string) (*exec.Cmd, <-chan string, <-chan bool, error) {
 	cmd := exec.Command("claude", args...)
 	cmd.Env = cleanEnv(envVars)
 	if workingDir != "" {
@@ -817,14 +850,14 @@ func launchClaude(args []string, prompt string, workingDir string, envVars map[s
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create stdout pipe: %v", err)
+		return nil, nil, nil, fmt.Errorf("failed to create stdout pipe: %v", err)
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create stderr pipe: %v", err)
+		return nil, nil, nil, fmt.Errorf("failed to create stderr pipe: %v", err)
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, nil, fmt.Errorf("failed to start claude: %v", err)
+		return nil, nil, nil, fmt.Errorf("failed to start claude: %v", err)
 	}
 
 	sessErrCh := make(chan bool, 1)
@@ -858,7 +891,7 @@ func launchClaude(args []string, prompt string, workingDir string, envVars map[s
 		}
 	}()
 
-	return lines, sessErrCh, nil
+	return cmd, lines, sessErrCh, nil
 }
 
 // startClaudeStream starts claude with session-retry support.
@@ -867,18 +900,22 @@ func launchClaude(args []string, prompt string, workingDir string, envVars map[s
 // Sends nil on ready when it is safe to write HTTP response headers; sends an
 // error if the process could not be started. After ready, read lines from the
 // returned channel until it is closed.
-func startClaudeStream(args []string, prompt string, workingDir string, envVars map[string]string) (<-chan string, <-chan error) {
+func startClaudeStream(args []string, prompt string, workingDir string, envVars map[string]string) (<-chan string, <-chan error, **exec.Cmd) {
 	lines := make(chan string, 128)
 	ready := make(chan error, 1)
+	// cmdPtr lets the caller kill the process after ready fires.
+	var cmdHolder *exec.Cmd
+	cmdPtr := &cmdHolder
 
 	go func() {
 		defer close(lines)
 
-		innerLines, sessErrCh, err := launchClaude(args, prompt, workingDir, envVars)
+		cmd, innerLines, sessErrCh, err := launchClaude(args, prompt, workingDir, envVars)
 		if err != nil {
 			ready <- err
 			return
 		}
+		cmdHolder = cmd
 
 		if hasArg(args, "--resume") {
 			// Buffer early events to detect failed --resume before committing.
@@ -921,11 +958,12 @@ func startClaudeStream(args []string, prompt string, workingDir string, envVars 
 				<-sessErrCh
 				log.Printf("Resume produced no content, retrying with --session-id")
 				retryArgs := replaceArg(args, "--resume", "--session-id")
-				innerLines, sessErrCh, err = launchClaude(retryArgs, prompt, workingDir, envVars)
+				cmd, innerLines, sessErrCh, err = launchClaude(retryArgs, prompt, workingDir, envVars)
 				if err != nil {
 					ready <- err
 					return
 				}
+				cmdHolder = cmd
 				go func() { <-sessErrCh }()
 
 				firstLine, ok := <-innerLines
@@ -966,12 +1004,12 @@ func startClaudeStream(args []string, prompt string, workingDir string, envVars 
 		}
 	}()
 
-	return lines, ready
+	return lines, ready, cmdPtr
 }
 
 // runClaude starts a claude process and collects its output events.
 func runClaude(args []string, prompt string, workingDir string, envVars map[string]string) (events []ClaudeEvent, lastText string, result string, usage *UsageInfo, err error) {
-	lines, sessErrCh, err := launchClaude(args, prompt, workingDir, envVars)
+	_, lines, sessErrCh, err := launchClaude(args, prompt, workingDir, envVars)
 	if err != nil {
 		return
 	}
@@ -1015,7 +1053,7 @@ func runClaude(args []string, prompt string, workingDir string, envVars map[stri
 
 // handleStreamResponse streams text output without tool call detection (fast path).
 func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, includeUsage bool, workingDir string, envVars map[string]string) {
-	lines, ready := startClaudeStream(args, prompt, workingDir, envVars)
+	lines, ready, cmdPtr := startClaudeStream(args, prompt, workingDir, envVars)
 	if err := <-ready; err != nil {
 		writeOAIError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
@@ -1038,6 +1076,11 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 
 	var streamDeltaSent bool // true if we've sent any stream_event deltas
 	seenToolNames := map[string]bool{} // deduplicate tool_call chunks across both detection paths
+
+	// AskUserQuestion tracking
+	var askUserIdx int = -1
+	var askUserID string
+	var askUserArgs strings.Builder
 
 	// Aggregated logging: accumulate chunks of the same event type and flush on type change
 	var aggType string      // current aggregated event type (e.g. "text_delta", "thinking_delta")
@@ -1090,6 +1133,13 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 				if err := json.Unmarshal(streamEvt.ContentBlock, &block); err == nil && block.Type == "tool_use" && block.Name != "" {
 					flushAggLog()
 					log.Printf("[STREAM TOOL_USE] name=%s id=%s", block.Name, block.ID)
+					if block.Name == "AskUserQuestion" {
+						askUserIdx = streamEvt.Index
+						askUserID = block.ID
+						log.Printf("[ASK_USER_QUESTION] detected at index=%d", streamEvt.Index)
+						// Don't emit the initial empty tool_call; wait for content_block_stop
+						continue
+					}
 					seenToolNames[block.Name] = true
 					tc := ToolCall{
 						ID:   block.ID,
@@ -1161,6 +1211,68 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 					fmt.Fprintf(w, "data: %s\n\n", data)
 					flusher.Flush()
 				}
+				if delta.Type == "input_json_delta" && askUserIdx >= 0 && streamEvt.Index == askUserIdx {
+					askUserArgs.WriteString(delta.PartialJSON)
+				}
+			}
+			// Handle content_block_stop for AskUserQuestion
+			if streamEvt.Type == "content_block_stop" && askUserIdx >= 0 && streamEvt.Index == askUserIdx {
+				flushAggLog()
+				log.Printf("[ASK_USER_QUESTION] complete, emitting tool_call and closing stream")
+
+				toolCall := ToolCall{
+					ID:   askUserID,
+					Type: "function",
+					Function: ToolCallFunction{
+						Name:      "AskUserQuestion",
+						Arguments: askUserArgs.String(),
+					},
+				}
+				chunk := ChatCompletionResponse{
+					ID:      chatID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   model,
+					Choices: []ChatCompletionChoice{
+						{
+							Index: 0,
+							Delta: &ChatMessage{
+								Role:      "assistant",
+								ToolCalls: []ToolCall{toolCall},
+							},
+						},
+					},
+				}
+				data, _ := json.Marshal(chunk)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+
+				finishReason := "stop"
+				finishChunk := ChatCompletionResponse{
+					ID:      chatID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   model,
+					Choices: []ChatCompletionChoice{
+						{Index: 0, Delta: NewChatMessage("", ""), FinishReason: &finishReason},
+					},
+				}
+				data, _ = json.Marshal(finishChunk)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+
+				fmt.Fprintf(w, "data: [DONE]\n\n")
+				flusher.Flush()
+
+				if cmd := *cmdPtr; cmd != nil && cmd.Process != nil {
+					log.Printf("[ASK_USER_QUESTION] killing Claude process pid=%d", cmd.Process.Pid)
+					cmd.Process.Kill()
+				}
+				go func() {
+					for range lines {
+					}
+				}()
+				return
 			}
 			continue
 		}
@@ -1284,7 +1396,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 // collecting full text to detect tool calls at the end.
 // Used when tools are defined in the request.
 func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, includeUsage bool, workingDir string, envVars map[string]string) {
-	lines, ready := startClaudeStream(args, prompt, workingDir, envVars)
+	lines, ready, cmdPtr := startClaudeStream(args, prompt, workingDir, envVars)
 	if err := <-ready; err != nil {
 		writeOAIError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
@@ -1316,6 +1428,9 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 	nativeTCs := map[int]*nativeToolCall{}
 	var nativeTCOrder []int
 
+	// AskUserQuestion tracking
+	var askUserIdx int = -1 // index of AskUserQuestion content block, -1 if none
+
 	for line := range lines {
 		if line == "" {
 			continue
@@ -1346,7 +1461,76 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 						nativeTCs[streamEvt.Index] = tc
 						nativeTCOrder = append(nativeTCOrder, streamEvt.Index)
 						log.Printf("[NATIVE TOOL_USE START] index=%d name=%s id=%s", streamEvt.Index, block.Name, block.ID)
+						if block.Name == "AskUserQuestion" {
+							askUserIdx = streamEvt.Index
+							log.Printf("[ASK_USER_QUESTION] detected at index=%d", streamEvt.Index)
+						}
 					}
+				}
+
+			case "content_block_stop":
+				// If the completed block is AskUserQuestion, emit it and end the stream
+				if askUserIdx >= 0 && streamEvt.Index == askUserIdx {
+					tc := nativeTCs[askUserIdx]
+					log.Printf("[ASK_USER_QUESTION] complete, emitting tool_call and closing stream")
+
+					// Emit as tool_call chunk
+					toolCall := ToolCall{
+						ID:   tc.ID,
+						Type: "function",
+						Function: ToolCallFunction{
+							Name:      "AskUserQuestion",
+							Arguments: tc.Args.String(),
+						},
+					}
+					chunk := ChatCompletionResponse{
+						ID:      chatID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   model,
+						Choices: []ChatCompletionChoice{
+							{
+								Index: 0,
+								Delta: &ChatMessage{
+									Role:      "assistant",
+									ToolCalls: []ToolCall{toolCall},
+								},
+							},
+						},
+					}
+					data, _ := json.Marshal(chunk)
+					fmt.Fprintf(w, "data: %s\n\n", data)
+					flusher.Flush()
+
+					// Emit finish_reason: "stop"
+					finishReason := "stop"
+					finishChunk := ChatCompletionResponse{
+						ID:      chatID,
+						Object:  "chat.completion.chunk",
+						Created: created,
+						Model:   model,
+						Choices: []ChatCompletionChoice{
+							{Index: 0, Delta: NewChatMessage("", ""), FinishReason: &finishReason},
+						},
+					}
+					data, _ = json.Marshal(finishChunk)
+					fmt.Fprintf(w, "data: %s\n\n", data)
+					flusher.Flush()
+
+					fmt.Fprintf(w, "data: [DONE]\n\n")
+					flusher.Flush()
+
+					// Kill the Claude process
+					if cmd := *cmdPtr; cmd != nil && cmd.Process != nil {
+						log.Printf("[ASK_USER_QUESTION] killing Claude process pid=%d", cmd.Process.Pid)
+						cmd.Process.Kill()
+					}
+					// Drain remaining lines so goroutine can exit
+					go func() {
+						for range lines {
+						}
+					}()
+					return
 				}
 
 			case "content_block_delta":
@@ -1579,7 +1763,14 @@ func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, args []stri
 		msg          *ChatMessage
 	)
 
-	if hasTools {
+	// Check for AskUserQuestion in events (works regardless of hasTools)
+	askUserCalls := extractAskUserQuestionCalls(events)
+	if len(askUserCalls) > 0 {
+		finishReason = "stop"
+		msg = NewChatMessage("assistant", fullText)
+		msg.ToolCalls = askUserCalls
+		log.Printf("Non-stream: detected AskUserQuestion, returning as tool_call with finish_reason=stop")
+	} else if hasTools {
 		// Extract native tool_use from events
 		var toolCalls []ToolCall
 		toolCalls = extractNativeToolCalls(events)
@@ -1698,6 +1889,13 @@ func main() {
 	mux.HandleFunc("/health", oaiHealthHandler)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		log.Printf("HTTP %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
 		mux.ServeHTTP(w, r)
 	})
