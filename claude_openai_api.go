@@ -551,9 +551,46 @@ func (f *toolCallFilter) Finish() (remaining string, blocks []string) {
 
 // ---- Message conversion ----
 
-// extractAndSaveImages detects image_url content parts in a message, saves each
-// base64-encoded image to a temp file, and returns the file paths.
-func extractAndSaveImages(content json.RawMessage) []string {
+// mimeToExt returns a file extension for common MIME types.
+func mimeToExt(mime string) string {
+	switch {
+	case strings.Contains(mime, "jpeg") || strings.Contains(mime, "jpg"):
+		return ".jpg"
+	case strings.Contains(mime, "png"):
+		return ".png"
+	case strings.Contains(mime, "gif"):
+		return ".gif"
+	case strings.Contains(mime, "webp"):
+		return ".webp"
+	case strings.Contains(mime, "pdf"):
+		return ".pdf"
+	case strings.Contains(mime, "csv"):
+		return ".csv"
+	case strings.Contains(mime, "json"):
+		return ".json"
+	case strings.Contains(mime, "html"):
+		return ".html"
+	case strings.Contains(mime, "xml"):
+		return ".xml"
+	case strings.Contains(mime, "zip"):
+		return ".zip"
+	case strings.Contains(mime, "plain") || strings.Contains(mime, "text"):
+		return ".txt"
+	case strings.Contains(mime, "markdown"):
+		return ".md"
+	default:
+		return ".bin"
+	}
+}
+
+type savedFile struct {
+	path    string
+	isImage bool
+}
+
+// extractAndSaveAttachments detects image_url and file_url content parts,
+// saves each base64-encoded payload to a temp file, and returns metadata.
+func extractAndSaveAttachments(content json.RawMessage) []savedFile {
 	if len(content) == 0 {
 		return nil
 	}
@@ -562,38 +599,55 @@ func extractAndSaveImages(content json.RawMessage) []string {
 		ImageURL *struct {
 			URL string `json:"url"`
 		} `json:"image_url,omitempty"`
+		FileURL *struct {
+			URL      string `json:"url"`
+			Filename string `json:"filename,omitempty"`
+		} `json:"file_url,omitempty"`
 	}
 	if err := json.Unmarshal(content, &parts); err != nil {
-		return nil // not an array, no images
+		return nil
 	}
-	var paths []string
+
+	var files []savedFile
 	for _, p := range parts {
-		if p.Type != "image_url" || p.ImageURL == nil {
+		var dataURL string
+		var isImage bool
+		var prefix string
+
+		switch {
+		case p.Type == "image_url" && p.ImageURL != nil:
+			dataURL = p.ImageURL.URL
+			isImage = true
+			prefix = "claude-img"
+		case p.Type == "file_url" && p.FileURL != nil:
+			dataURL = p.FileURL.URL
+			isImage = false
+			prefix = "claude-file"
+		default:
 			continue
 		}
-		url := p.ImageURL.URL
-		if !strings.HasPrefix(url, "data:") {
+
+		if !strings.HasPrefix(dataURL, "data:") {
 			continue
 		}
-		comma := strings.Index(url, ",")
+		comma := strings.Index(dataURL, ",")
 		if comma < 0 {
 			continue
 		}
-		header := url[5:comma] // e.g. "image/png;base64"
-		b64Data := url[comma+1:]
+		header := dataURL[5:comma] // e.g. "image/png;base64"
+		b64Data := dataURL[comma+1:]
 
-		ext := ".png"
-		if strings.Contains(header, "jpeg") || strings.Contains(header, "jpg") {
-			ext = ".jpg"
-		} else if strings.Contains(header, "gif") {
-			ext = ".gif"
-		} else if strings.Contains(header, "webp") {
-			ext = ".webp"
+		ext := mimeToExt(header)
+		// honour explicit filename extension if provided
+		if p.Type == "file_url" && p.FileURL != nil && p.FileURL.Filename != "" {
+			if dot := strings.LastIndex(p.FileURL.Filename, "."); dot >= 0 {
+				ext = p.FileURL.Filename[dot:]
+			}
 		}
 
-		imgBytes, err := base64.StdEncoding.DecodeString(b64Data)
+		fileBytes, err := base64.StdEncoding.DecodeString(b64Data)
 		if err != nil {
-			log.Printf("Failed to decode image base64: %v", err)
+			log.Printf("Failed to decode attachment base64: %v", err)
 			continue
 		}
 
@@ -601,15 +655,15 @@ func extractAndSaveImages(content json.RawMessage) []string {
 		if _, err := rand.Read(randBytes[:]); err != nil {
 			continue
 		}
-		tmpPath := fmt.Sprintf("/tmp/claude-img-%s%s", hex.EncodeToString(randBytes[:]), ext)
-		if err := os.WriteFile(tmpPath, imgBytes, 0600); err != nil {
-			log.Printf("Failed to write temp image %s: %v", tmpPath, err)
+		tmpPath := fmt.Sprintf("/tmp/%s-%s%s", prefix, hex.EncodeToString(randBytes[:]), ext)
+		if err := os.WriteFile(tmpPath, fileBytes, 0600); err != nil {
+			log.Printf("Failed to write temp file %s: %v", tmpPath, err)
 			continue
 		}
-		log.Printf("Saved attached image to: %s", tmpPath)
-		paths = append(paths, tmpPath)
+		log.Printf("Saved attachment to: %s", tmpPath)
+		files = append(files, savedFile{path: tmpPath, isImage: isImage})
 	}
-	return paths
+	return files
 }
 
 // buildPromptFromMessages converts OpenAI-style messages into a single prompt string
@@ -622,12 +676,18 @@ func buildPromptFromMessages(messages []ChatMessage) (prompt string, systemPromp
 			systemPrompt = msg.ContentString()
 		case "user":
 			text := msg.ContentString()
-			imgPaths := extractAndSaveImages(msg.Content)
-			tempFiles = append(tempFiles, imgPaths...)
-			if len(imgPaths) > 0 {
+			attachments := extractAndSaveAttachments(msg.Content)
+			for _, a := range attachments {
+				tempFiles = append(tempFiles, a.path)
+			}
+			if len(attachments) > 0 {
 				var refs []string
-				for _, p := range imgPaths {
-					refs = append(refs, fmt.Sprintf("[Image: %s]", p))
+				for _, a := range attachments {
+					if a.isImage {
+						refs = append(refs, fmt.Sprintf("[Image: %s]", a.path))
+					} else {
+						refs = append(refs, fmt.Sprintf("[File: %s]", a.path))
+					}
 				}
 				if text != "" {
 					text += "\n"
@@ -763,11 +823,11 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		args = append(args, "--system-prompt", systemPrompt)
 	}
 	args = append(args, "--model", model)
-	args = append(args, "--betas", "context-1m-2025-08-07")
+	//args = append(args, "--betas", "context-1m-2025-08-07")
 	args = append(args, "--verbose")
 	args = append(args, "--output-format", "stream-json")
 	args = append(args, "--include-partial-messages")
-	args = append(args, "--permission-mode", "acceptEdits")
+	args = append(args, "--permission-mode", "bypassPermissions")
 
 	maxTurns := 200
 	if req.MaxTurns != nil {
