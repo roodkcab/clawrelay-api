@@ -1119,6 +1119,15 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 		return
 	}
 
+	// Kill the claude process if the client disconnects.
+	go func() {
+		<-r.Context().Done()
+		if cmd := *cmdPtr; cmd != nil && cmd.Process != nil {
+			log.Printf("Client disconnected, killing Claude process pid=%d", cmd.Process.Pid)
+			cmd.Process.Kill()
+		}
+	}()
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1461,6 +1470,15 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 		writeOAIError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
+
+	// Kill the claude process if the client disconnects.
+	go func() {
+		<-r.Context().Done()
+		if cmd := *cmdPtr; cmd != nil && cmd.Process != nil {
+			log.Printf("Client disconnected, killing Claude process pid=%d", cmd.Process.Pid)
+			cmd.Process.Kill()
+		}
+	}()
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
