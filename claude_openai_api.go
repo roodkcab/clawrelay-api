@@ -846,15 +846,19 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	workingDir := req.WorkingDir
 	envVars := req.EnvVars
 
+	// Log request to session store
+	sessionID := req.SessionID
+	sessionLogRequest(sessionID, &req)
+
 	if req.Stream {
 		if hasTools {
 			// Buffer output to properly detect and format tool calls
-			handleBufferedStreamResponse(w, r, args, prompt, chatID, created, model, includeUsage, workingDir, envVars)
+			handleBufferedStreamResponse(w, r, args, prompt, chatID, created, model, includeUsage, workingDir, envVars, sessionID)
 		} else {
-			handleStreamResponse(w, r, args, prompt, chatID, created, model, includeUsage, workingDir, envVars)
+			handleStreamResponse(w, r, args, prompt, chatID, created, model, includeUsage, workingDir, envVars, sessionID)
 		}
 	} else {
-		handleNonStreamResponse(w, r, args, prompt, chatID, created, model, hasTools, workingDir, envVars)
+		handleNonStreamResponse(w, r, args, prompt, chatID, created, model, hasTools, workingDir, envVars, sessionID)
 	}
 }
 
@@ -1112,7 +1116,7 @@ func runClaude(args []string, prompt string, workingDir string, envVars map[stri
 }
 
 // handleStreamResponse streams text output without tool call detection (fast path).
-func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, includeUsage bool, workingDir string, envVars map[string]string) {
+func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, includeUsage bool, workingDir string, envVars map[string]string, sessionID string) {
 	lines, ready, cmdPtr := startClaudeStream(args, prompt, workingDir, envVars)
 	if err := <-ready; err != nil {
 		writeOAIError(w, http.StatusInternalServerError, "server_error", err.Error())
@@ -1202,6 +1206,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 				if err := json.Unmarshal(streamEvt.ContentBlock, &block); err == nil && block.Type == "tool_use" && block.Name != "" {
 					flushAggLog()
 					log.Printf("[STREAM TOOL_USE] name=%s id=%s", block.Name, block.ID)
+					sessionLogToolUse(sessionID, block.Name, block.ID)
 					if block.Name == "AskUserQuestion" {
 						askUserIdx = streamEvt.Index
 						askUserID = block.ID
@@ -1243,6 +1248,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 				if delta.Type == "text_delta" && delta.Text != "" {
 					streamDeltaSent = true
 					aggAppend("text_delta", delta.Text)
+					sessionLogDelta(sessionID, delta.Text)
 
 					chunk := ChatCompletionResponse{
 						ID:      chatID,
@@ -1456,6 +1462,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 	}
 
 	flushAggLog() // flush any remaining aggregated log
+	sessionLogDone(sessionID, nil)
 
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
@@ -1464,7 +1471,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 // handleBufferedStreamResponse streams text deltas in real-time while also
 // collecting full text to detect tool calls at the end.
 // Used when tools are defined in the request.
-func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, includeUsage bool, workingDir string, envVars map[string]string) {
+func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, includeUsage bool, workingDir string, envVars map[string]string, sessionID string) {
 	lines, ready, cmdPtr := startClaudeStream(args, prompt, workingDir, envVars)
 	if err := <-ready; err != nil {
 		writeOAIError(w, http.StatusInternalServerError, "server_error", err.Error())
@@ -1622,6 +1629,7 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 						if delta.Text != "" {
 							streamDeltaSent = true
 							fullText.WriteString(delta.Text)
+							sessionLogDelta(sessionID, delta.Text)
 							safeText := filter.Feed(delta.Text)
 							if safeText != "" {
 								log.Printf("[BUFFERED STREAM DELTA] len=%d content=%q", len(safeText), truncate(safeText, 200))
@@ -1809,11 +1817,13 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 		flusher.Flush()
 	}
 
+	sessionLogDone(sessionID, finalUsage)
+
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }
 
-func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, hasTools bool, workingDir string, envVars map[string]string) {
+func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, hasTools bool, workingDir string, envVars map[string]string, sessionID string) {
 	events, lastText, result, usage, err := runClaude(args, prompt, workingDir, envVars)
 	if err != nil {
 		writeOAIError(w, http.StatusInternalServerError, "server_error", err.Error())
@@ -1895,6 +1905,9 @@ func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, args []stri
 		Usage: usage,
 	}
 
+	sessionLogDelta(sessionID, fullText)
+	sessionLogDone(sessionID, usage)
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
@@ -1965,6 +1978,8 @@ func main() {
 	mux.HandleFunc("/v1/models", modelsHandler)
 	mux.HandleFunc("/v1/stats", statsHandler)
 	mux.HandleFunc("/health", oaiHealthHandler)
+	mux.HandleFunc("/sessions", sessionListHandler)
+	mux.HandleFunc("/session/", sessionPageHandler)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -1985,6 +2000,8 @@ func main() {
 	log.Printf("  GET  /v1/models            (Model list)")
 	log.Printf("  GET  /v1/stats             (Token usage statistics)")
 	log.Printf("  GET  /health               (Health check)")
+	log.Printf("  GET  /sessions             (List all sessions)")
+	log.Printf("  GET  /session/{id}         (Session viewer with WebSocket)")
 
 	if err := http.ListenAndServe(port, handler); err != nil {
 		log.Fatal(err)
