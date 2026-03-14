@@ -3,15 +3,18 @@ package main
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -591,8 +594,10 @@ type savedFile struct {
 }
 
 // extractAndSaveAttachments detects image_url and file_url content parts,
-// saves each base64-encoded payload to a temp file, and returns metadata.
-func extractAndSaveAttachments(content json.RawMessage) []savedFile {
+// saves each base64-encoded payload to a file, and returns metadata.
+// If sessionDir is non-empty, files are saved there (session-scoped) and
+// content-hashed to avoid duplicate writes; otherwise they go to /tmp.
+func extractAndSaveAttachments(content json.RawMessage, sessionDir string) []savedFile {
 	if len(content) == 0 {
 		return nil
 	}
@@ -608,6 +613,11 @@ func extractAndSaveAttachments(content json.RawMessage) []savedFile {
 	}
 	if err := json.Unmarshal(content, &parts); err != nil {
 		return nil
+	}
+
+	// Ensure session directory exists once (not per-attachment).
+	if sessionDir != "" {
+		os.MkdirAll(sessionDir, 0755)
 	}
 
 	var files []savedFile
@@ -647,30 +657,53 @@ func extractAndSaveAttachments(content json.RawMessage) []savedFile {
 			}
 		}
 
+		dir := "/tmp"
+		if sessionDir != "" {
+			dir = sessionDir
+		}
+
+		// For session-scoped storage, use a hash of the base64 string as
+		// filename to deduplicate. We hash the raw b64 text (cheap) to
+		// check existence *before* doing the expensive base64 decode.
+		var filePath string
+		if sessionDir != "" {
+			hash := sha256.Sum256([]byte(b64Data))
+			name := fmt.Sprintf("%s-%s%s", prefix, hex.EncodeToString(hash[:8]), ext)
+			filePath = filepath.Join(dir, name)
+			if _, err := os.Stat(filePath); err == nil {
+				// File already exists — skip decode and write entirely.
+				files = append(files, savedFile{path: filePath, isImage: isImage})
+				continue
+			}
+		} else {
+			var randBytes [8]byte
+			if _, err := rand.Read(randBytes[:]); err != nil {
+				continue
+			}
+			filePath = filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, hex.EncodeToString(randBytes[:]), ext))
+		}
+
 		fileBytes, err := base64.StdEncoding.DecodeString(b64Data)
 		if err != nil {
 			log.Printf("Failed to decode attachment base64: %v", err)
 			continue
 		}
 
-		var randBytes [8]byte
-		if _, err := rand.Read(randBytes[:]); err != nil {
+		if err := os.WriteFile(filePath, fileBytes, 0600); err != nil {
+			log.Printf("Failed to write file %s: %v", filePath, err)
 			continue
 		}
-		tmpPath := fmt.Sprintf("/tmp/%s-%s%s", prefix, hex.EncodeToString(randBytes[:]), ext)
-		if err := os.WriteFile(tmpPath, fileBytes, 0600); err != nil {
-			log.Printf("Failed to write temp file %s: %v", tmpPath, err)
-			continue
-		}
-		log.Printf("Saved attachment to: %s", tmpPath)
-		files = append(files, savedFile{path: tmpPath, isImage: isImage})
+		log.Printf("Saved attachment to: %s", filePath)
+		files = append(files, savedFile{path: filePath, isImage: isImage})
 	}
 	return files
 }
 
 // buildPromptFromMessages converts OpenAI-style messages into a single prompt string
 // and extracts the system prompt separately.
-func buildPromptFromMessages(messages []ChatMessage) (prompt string, systemPrompt string, tempFiles []string) {
+// If sessionDir is non-empty, attachments are saved there (session-scoped) and
+// tempFiles will be nil (caller should not clean up per-request).
+func buildPromptFromMessages(messages []ChatMessage, sessionDir string) (prompt string, systemPrompt string, tempFiles []string) {
 	var parts []string
 	for _, msg := range messages {
 		switch msg.Role {
@@ -678,9 +711,12 @@ func buildPromptFromMessages(messages []ChatMessage) (prompt string, systemPromp
 			systemPrompt = msg.ContentString()
 		case "user":
 			text := msg.ContentString()
-			attachments := extractAndSaveAttachments(msg.Content)
+			attachments := extractAndSaveAttachments(msg.Content, sessionDir)
 			for _, a := range attachments {
-				tempFiles = append(tempFiles, a.path)
+				if sessionDir == "" {
+					// Only track for cleanup when not session-scoped
+					tempFiles = append(tempFiles, a.path)
+				}
 			}
 			if len(attachments) > 0 {
 				var refs []string
@@ -781,7 +817,11 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		writeOAIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Failed to read body: %v", err))
 		return
 	}
-	log.Printf("Raw request body (%d bytes): %s", len(bodyBytes), string(bodyBytes))
+	if len(bodyBytes) <= 4096 {
+		log.Printf("Raw request body (%d bytes): %s", len(bodyBytes), string(bodyBytes))
+	} else {
+		log.Printf("Raw request body (%d bytes): %s...[truncated]", len(bodyBytes), string(bodyBytes[:4096]))
+	}
 
 	var req ChatCompletionRequest
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
@@ -797,7 +837,19 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	if model == "" {
 		model = defaultModel
 	}
-	prompt, systemPrompt, tempFiles := buildPromptFromMessages(req.Messages)
+	// If session_id is provided, save attachments to session-scoped directory
+	// so they persist across follow-up messages.
+	var sessionDir string
+	if req.SessionID != "" {
+		dir := globalSessionStore.dir
+		if !filepath.IsAbs(dir) {
+			if abs, err := filepath.Abs(dir); err == nil {
+				dir = abs
+			}
+		}
+		sessionDir = filepath.Join(dir, req.SessionID, "files")
+	}
+	prompt, systemPrompt, tempFiles := buildPromptFromMessages(req.Messages, sessionDir)
 	if len(tempFiles) > 0 {
 		defer func() {
 			for _, f := range tempFiles {
@@ -822,7 +874,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	// Build claude CLI args
 	args := []string{}
 	if systemPrompt != "" {
-		args = append(args, "--system-prompt", systemPrompt)
+		args = append(args, "--append-system-prompt", systemPrompt)
 	}
 	args = append(args, "--model", model)
 	//args = append(args, "--betas", "context-1m-2025-08-07")
@@ -1965,6 +2017,9 @@ func writeOAIError(w http.ResponseWriter, statusCode int, errType string, messag
 }
 
 func main() {
+	port := flag.String("port", "50008", "port to listen on")
+	flag.Parse()
+
 	logFile, err := os.OpenFile("claude_openai_api.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
@@ -1974,6 +2029,9 @@ func main() {
 	multiWriter := io.MultiWriter(os.Stdout, logFile)
 	log.SetOutput(multiWriter)
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
+
+	// Clean up sessions older than 72 hours, check every hour.
+	globalSessionStore.startSessionCleanup(72*time.Hour, 1*time.Hour)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", chatCompletionsHandler)
@@ -1995,8 +2053,8 @@ func main() {
 		mux.ServeHTTP(w, r)
 	})
 
-	port := ":50009"
-	log.Printf("Starting Claude OpenAI-compatible API server on %s", port)
+	addr := ":" + *port
+	log.Printf("Starting Claude OpenAI-compatible API server on %s", addr)
 	log.Printf("Endpoints:")
 	log.Printf("  POST /v1/chat/completions  (OpenAI-compatible chat completions, with tool calling)")
 	log.Printf("  GET  /v1/models            (Model list)")
@@ -2005,7 +2063,7 @@ func main() {
 	log.Printf("  GET  /sessions             (List all sessions)")
 	log.Printf("  GET  /session/{id}         (Session viewer with WebSocket)")
 
-	if err := http.ListenAndServe(port, handler); err != nil {
+	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatal(err)
 	}
 }

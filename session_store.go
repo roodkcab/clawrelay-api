@@ -225,6 +225,80 @@ func sessionLogError(sessionID string, errMsg string) {
 	})
 }
 
+// startSessionCleanup runs a background goroutine that periodically removes
+// sessions (log files, attachment directories, and in-memory state) older than maxAge.
+func (s *sessionStore) startSessionCleanup(maxAge time.Duration, interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.cleanupOldSessions(maxAge)
+		}
+	}()
+}
+
+func (s *sessionStore) cleanupOldSessions(maxAge time.Duration) {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-maxAge)
+	for _, e := range entries {
+		name := e.Name()
+		// Handle both session log files (.jsonl) and session directories
+		var sessionID string
+		var modTime time.Time
+
+		if e.IsDir() {
+			// Session attachment directory — check mod time
+			sessionID = name
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			modTime = info.ModTime()
+		} else if strings.HasSuffix(name, ".jsonl") {
+			sessionID = strings.TrimSuffix(name, ".jsonl")
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			modTime = info.ModTime()
+		} else {
+			continue
+		}
+
+		if modTime.After(cutoff) {
+			continue
+		}
+
+		// Remove log file
+		logPath := filepath.Join(s.dir, sessionID+".jsonl")
+		if err := os.Remove(logPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("session cleanup: failed to remove %s: %v", logPath, err)
+		}
+		// Remove attachment directory
+		filesDir := filepath.Join(s.dir, sessionID)
+		if err := os.RemoveAll(filesDir); err != nil {
+			log.Printf("session cleanup: failed to remove %s: %v", filesDir, err)
+		}
+
+		// Remove from in-memory store
+		s.mu.Lock()
+		if entry, ok := s.sessions[sessionID]; ok {
+			entry.mu.Lock()
+			if entry.logFile != nil {
+				entry.logFile.Close()
+			}
+			entry.mu.Unlock()
+			delete(s.sessions, sessionID)
+		}
+		s.mu.Unlock()
+
+		log.Printf("session cleanup: removed expired session %s (last modified: %s)", sessionID, modTime.Format(time.RFC3339))
+	}
+}
+
 // ---- WebSocket + HTML handlers ----
 
 var wsUpgrader = websocket.Upgrader{
