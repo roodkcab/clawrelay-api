@@ -123,7 +123,8 @@ type ChatCompletionChoice struct {
 }
 
 type PromptTokensDetails struct {
-	CachedTokens int `json:"cached_tokens"`
+	CachedTokens        int `json:"cached_tokens"`
+	CacheCreationTokens int `json:"cache_creation_tokens,omitempty"`
 }
 
 type UsageInfo struct {
@@ -287,9 +288,10 @@ func buildUsageInfo(cu *ClaudeUsage) *UsageInfo {
 		CompletionTokens: cu.OutputTokens,
 		TotalTokens:      promptTokens + cu.OutputTokens,
 	}
-	if cu.CacheReadInputTokens > 0 {
+	if cu.CacheReadInputTokens > 0 || cu.CacheCreationInputTokens > 0 {
 		u.PromptTokensDetails = &PromptTokensDetails{
-			CachedTokens: cu.CacheReadInputTokens,
+			CachedTokens:        cu.CacheReadInputTokens,
+			CacheCreationTokens: cu.CacheCreationInputTokens,
 		}
 	}
 	return u
