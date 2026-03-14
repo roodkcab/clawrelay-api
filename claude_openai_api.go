@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/rand"
 	"encoding/base64"
+	"flag"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -1965,6 +1966,9 @@ func writeOAIError(w http.ResponseWriter, statusCode int, errType string, messag
 }
 
 func main() {
+	portFlag := flag.Int("port", 50009, "server listen port")
+	flag.Parse()
+
 	logFile, err := os.OpenFile("claude_openai_api.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
@@ -1995,7 +1999,7 @@ func main() {
 		mux.ServeHTTP(w, r)
 	})
 
-	port := ":50009"
+	port := fmt.Sprintf(":%d", *portFlag)
 	log.Printf("Starting Claude OpenAI-compatible API server on %s", port)
 	log.Printf("Endpoints:")
 	log.Printf("  POST /v1/chat/completions  (OpenAI-compatible chat completions, with tool calling)")
