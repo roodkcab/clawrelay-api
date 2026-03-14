@@ -1237,6 +1237,14 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 		aggCount++
 	}
 
+	// Track tool_use blocks for session logging with input
+	type toolBlock struct {
+		Name string
+		ID   string
+		Args strings.Builder
+	}
+	toolBlocks := map[int]*toolBlock{}
+
 	for line := range lines {
 		if line == "" {
 			continue
@@ -1260,7 +1268,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 				if err := json.Unmarshal(streamEvt.ContentBlock, &block); err == nil && block.Type == "tool_use" && block.Name != "" {
 					flushAggLog()
 					log.Printf("[STREAM TOOL_USE] name=%s id=%s", block.Name, block.ID)
-					sessionLogToolUse(sessionID, block.Name, block.ID)
+					toolBlocks[streamEvt.Index] = &toolBlock{Name: block.Name, ID: block.ID}
 					if block.Name == "AskUserQuestion" {
 						askUserIdx = streamEvt.Index
 						askUserID = block.ID
@@ -1340,8 +1348,20 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 					fmt.Fprintf(w, "data: %s\n\n", data)
 					flusher.Flush()
 				}
-				if delta.Type == "input_json_delta" && askUserIdx >= 0 && streamEvt.Index == askUserIdx {
-					askUserArgs.WriteString(delta.PartialJSON)
+				if delta.Type == "input_json_delta" {
+					if tb, ok := toolBlocks[streamEvt.Index]; ok {
+						tb.Args.WriteString(delta.PartialJSON)
+					}
+					if askUserIdx >= 0 && streamEvt.Index == askUserIdx {
+						askUserArgs.WriteString(delta.PartialJSON)
+					}
+				}
+			}
+			// Log tool_use with input at content_block_stop
+			if streamEvt.Type == "content_block_stop" {
+				if tb, ok := toolBlocks[streamEvt.Index]; ok {
+					sessionLogToolUse(sessionID, tb.Name, tb.ID, tb.Args.String())
+					delete(toolBlocks, streamEvt.Index)
 				}
 			}
 			// Handle content_block_stop for AskUserQuestion
@@ -1608,6 +1628,10 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 				}
 
 			case "content_block_stop":
+				// Log tool_use with accumulated input
+				if tc, ok := nativeTCs[streamEvt.Index]; ok {
+					sessionLogToolUse(sessionID, tc.Name, tc.ID, tc.Args.String())
+				}
 				// If the completed block is AskUserQuestion, emit it and end the stream
 				if askUserIdx >= 0 && streamEvt.Index == askUserIdx {
 					tc := nativeTCs[askUserIdx]
