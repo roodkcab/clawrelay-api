@@ -2041,8 +2041,16 @@ func writeOAIError(w http.ResponseWriter, statusCode int, errType string, messag
 }
 
 func main() {
-	port := flag.String("port", "50008", "port to listen on")
+	port := flag.String("port", "50009", "port to listen on")
+	proxy := flag.String("proxy", "", "HTTP/HTTPS proxy URL (e.g. http://127.0.0.1:7890)")
 	flag.Parse()
+
+	if *proxy != "" {
+		os.Setenv("HTTP_PROXY", *proxy)
+		os.Setenv("HTTPS_PROXY", *proxy)
+		os.Setenv("http_proxy", *proxy)
+		os.Setenv("https_proxy", *proxy)
+	}
 
 	logFile, err := os.OpenFile("claude_openai_api.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
@@ -2078,6 +2086,9 @@ func main() {
 	})
 
 	addr := ":" + *port
+	if *proxy != "" {
+		log.Printf("Using proxy: %s", *proxy)
+	}
 	log.Printf("Starting Claude OpenAI-compatible API server on %s", addr)
 	log.Printf("Endpoints:")
 	log.Printf("  POST /v1/chat/completions  (OpenAI-compatible chat completions, with tool calling)")
