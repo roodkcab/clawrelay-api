@@ -152,12 +152,13 @@ type ModelInfo struct {
 // ---- Claude stream-json event types ----
 
 type ClaudeEvent struct {
-	Type    string          `json:"type"`
-	Subtype string          `json:"subtype,omitempty"`
-	Message json.RawMessage `json:"message,omitempty"`
-	Event   json.RawMessage `json:"event,omitempty"` // for stream_event wrapper
-	Result  string          `json:"result,omitempty"`
-	Usage   *ClaudeUsage    `json:"usage,omitempty"`
+	Type         string          `json:"type"`
+	Subtype      string          `json:"subtype,omitempty"`
+	Message      json.RawMessage `json:"message,omitempty"`
+	Event        json.RawMessage `json:"event,omitempty"` // for stream_event wrapper
+	Result       string          `json:"result,omitempty"`
+	Usage        *ClaudeUsage    `json:"usage,omitempty"`
+	TotalCostUSD float64         `json:"total_cost_usd,omitempty"`
 }
 
 // StreamAPIEvent represents the inner event of a stream_event wrapper,
@@ -211,29 +212,38 @@ type ClaudeUsage struct {
 // ---- Token statistics ----
 
 type ModelTokenStats struct {
-	Requests int64 `json:"requests"`
-	Input    int64 `json:"input_tokens"`
-	Output   int64 `json:"output_tokens"`
-	Total    int64 `json:"total_tokens"`
+	Requests     int64   `json:"requests"`
+	Input        int64   `json:"input_tokens"`
+	Output       int64   `json:"output_tokens"`
+	CacheCreation int64  `json:"cache_creation_input_tokens"`
+	CacheRead    int64   `json:"cache_read_input_tokens"`
+	Total        int64   `json:"total_tokens"`
+	CostUSD      float64 `json:"cost_usd"`
 }
 
 type TokenStatsSnapshot struct {
 	TotalRequests int64                       `json:"total_requests"`
 	InputTokens   int64                       `json:"input_tokens"`
 	OutputTokens  int64                       `json:"output_tokens"`
+	CacheCreation int64                       `json:"cache_creation_input_tokens"`
+	CacheRead     int64                       `json:"cache_read_input_tokens"`
 	TotalTokens   int64                       `json:"total_tokens"`
+	CostUSD       float64                     `json:"cost_usd"`
 	PerModel      map[string]*ModelTokenStats `json:"per_model"`
 	StartTime     string                      `json:"start_time"`
 	Uptime        string                      `json:"uptime"`
 }
 
 type tokenStats struct {
-	mu        sync.Mutex
-	requests  int64
-	input     int64
-	output    int64
-	perModel  map[string]*ModelTokenStats
-	startTime time.Time
+	mu            sync.Mutex
+	requests      int64
+	input         int64
+	output        int64
+	cacheCreation int64
+	cacheRead     int64
+	costUSD       float64
+	perModel      map[string]*ModelTokenStats
+	startTime     time.Time
 }
 
 var globalStats = &tokenStats{
@@ -241,12 +251,15 @@ var globalStats = &tokenStats{
 	startTime: time.Now(),
 }
 
-func (s *tokenStats) Record(model string, input, output int) {
+func (s *tokenStats) Record(model string, input, output, cacheCreation, cacheRead int, costUSD float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requests++
 	s.input += int64(input)
 	s.output += int64(output)
+	s.cacheCreation += int64(cacheCreation)
+	s.cacheRead += int64(cacheRead)
+	s.costUSD += costUSD
 
 	ms, ok := s.perModel[model]
 	if !ok {
@@ -256,7 +269,10 @@ func (s *tokenStats) Record(model string, input, output int) {
 	ms.Requests++
 	ms.Input += int64(input)
 	ms.Output += int64(output)
-	ms.Total += int64(input + output)
+	ms.CacheCreation += int64(cacheCreation)
+	ms.CacheRead += int64(cacheRead)
+	ms.Total += int64(input + output + cacheCreation + cacheRead)
+	ms.CostUSD += costUSD
 }
 
 func (s *tokenStats) Snapshot() TokenStatsSnapshot {
@@ -271,7 +287,10 @@ func (s *tokenStats) Snapshot() TokenStatsSnapshot {
 		TotalRequests: s.requests,
 		InputTokens:   s.input,
 		OutputTokens:  s.output,
-		TotalTokens:   s.input + s.output,
+		CacheCreation: s.cacheCreation,
+		CacheRead:     s.cacheRead,
+		TotalTokens:   s.input + s.output + s.cacheCreation + s.cacheRead,
+		CostUSD:       s.costUSD,
 		PerModel:      pm,
 		StartTime:     s.startTime.Format(time.RFC3339),
 		Uptime:        time.Since(s.startTime).Truncate(time.Second).String(),
@@ -1126,7 +1145,7 @@ func startClaudeStream(args []string, prompt string, workingDir string, envVars 
 }
 
 // runClaude starts a claude process and collects its output events.
-func runClaude(args []string, prompt string, workingDir string, envVars map[string]string) (events []ClaudeEvent, lastText string, result string, usage *UsageInfo, err error) {
+func runClaude(args []string, prompt string, workingDir string, envVars map[string]string) (events []ClaudeEvent, lastText string, result string, usage *UsageInfo, rawUsage *ClaudeUsage, costUSD float64, err error) {
 	_, lines, sessErrCh, err := launchClaude(args, prompt, workingDir, envVars)
 	if err != nil {
 		return
@@ -1154,6 +1173,8 @@ func runClaude(args []string, prompt string, workingDir string, envVars map[stri
 			}
 			if event.Usage != nil {
 				usage = buildUsageInfo(event.Usage)
+				rawUsage = event.Usage
+				costUSD = event.TotalCostUSD
 			}
 		}
 	}
@@ -1202,6 +1223,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 	flusher.Flush()
 
 	var streamDeltaSent bool // true if we've sent any stream_event deltas
+	var streamUsage *UsageInfo // captured from result event for session logging
 	seenToolNames := map[string]bool{} // deduplicate tool_call chunks across both detection paths
 
 	// AskUserQuestion tracking
@@ -1493,10 +1515,12 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 
 		if event.Type == "result" {
 			if event.Usage != nil {
-				globalStats.Record(model, event.Usage.InputTokens, event.Usage.OutputTokens)
-				log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d",
+				globalStats.Record(model, event.Usage.InputTokens, event.Usage.OutputTokens,
+					event.Usage.CacheCreationInputTokens, event.Usage.CacheReadInputTokens, event.TotalCostUSD)
+				log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f",
 					model, event.Usage.InputTokens, event.Usage.OutputTokens,
-					event.Usage.CacheReadInputTokens, event.Usage.CacheCreationInputTokens)
+					event.Usage.CacheReadInputTokens, event.Usage.CacheCreationInputTokens, event.TotalCostUSD)
+				streamUsage = buildUsageInfo(event.Usage)
 			}
 
 			// finish_reason chunk (no usage here, vLLM style)
@@ -1526,7 +1550,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 					Created: created,
 					Model:   model,
 					Choices: []ChatCompletionChoice{},
-					Usage:   buildUsageInfo(event.Usage),
+					Usage:   streamUsage,
 				}
 				data, _ = json.Marshal(usageChunk)
 				fmt.Fprintf(w, "data: %s\n\n", data)
@@ -1536,7 +1560,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 	}
 
 	flushAggLog() // flush any remaining aggregated log
-	sessionLogDone(sessionID, nil)
+	sessionLogDone(sessionID, streamUsage)
 
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
@@ -1776,10 +1800,11 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 			}
 			if event.Usage != nil {
 				finalUsage = buildUsageInfo(event.Usage)
-				globalStats.Record(model, event.Usage.InputTokens, event.Usage.OutputTokens)
-				log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d",
+				globalStats.Record(model, event.Usage.InputTokens, event.Usage.OutputTokens,
+					event.Usage.CacheCreationInputTokens, event.Usage.CacheReadInputTokens, event.TotalCostUSD)
+				log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f",
 					model, event.Usage.InputTokens, event.Usage.OutputTokens,
-					event.Usage.CacheReadInputTokens, event.Usage.CacheCreationInputTokens)
+					event.Usage.CacheReadInputTokens, event.Usage.CacheCreationInputTokens, event.TotalCostUSD)
 			}
 		}
 	}
@@ -1902,7 +1927,7 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 }
 
 func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt string, chatID string, created int64, model string, hasTools bool, workingDir string, envVars map[string]string, sessionID string) {
-	events, lastText, result, usage, err := runClaude(args, prompt, workingDir, envVars)
+	events, lastText, result, usage, rawUsage, costUSD, err := runClaude(args, prompt, workingDir, envVars)
 	if err != nil {
 		writeOAIError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
@@ -1914,14 +1939,12 @@ func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, args []stri
 	}
 
 	// Record token stats
-	if usage != nil {
-		globalStats.Record(model, usage.PromptTokens, usage.CompletionTokens)
-		cached := 0
-		if usage.PromptTokensDetails != nil {
-			cached = usage.PromptTokensDetails.CachedTokens
-		}
-		log.Printf("Token usage: model=%s prompt=%d output=%d total=%d cached=%d",
-			model, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, cached)
+	if rawUsage != nil {
+		globalStats.Record(model, rawUsage.InputTokens, rawUsage.OutputTokens,
+			rawUsage.CacheCreationInputTokens, rawUsage.CacheReadInputTokens, costUSD)
+		log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f",
+			model, rawUsage.InputTokens, rawUsage.OutputTokens,
+			rawUsage.CacheReadInputTokens, rawUsage.CacheCreationInputTokens, costUSD)
 	}
 
 	var (
