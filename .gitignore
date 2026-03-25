@@ -4,3 +4,6 @@ claude_openai_api
 bin
 *.out
 *.log
+/claude_openai_api_linux_amd64
+/clawrelay-api
+/clawrelay-api_linux_amd64
