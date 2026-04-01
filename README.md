@@ -67,9 +67,22 @@ Output:
 Starting Claude OpenAI-compatible API server on :50009
 ```
 
+**Command-line flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--port` | `50009` | Port to listen on |
+| `--model` | `claude-sonnet-4-6` | Default model name (e.g. `MiniMax-M2.7`, `glm-5.1`) |
+| `--proxy` | — | HTTP/HTTPS proxy URL (e.g. `http://127.0.0.1:7890`) |
+
+> **Use a different model provider:**
+> ```bash
+> ./clawrelay-api --model MiniMax-M2.7
+> ```
+
 > **Behind a proxy?**
 > ```bash
-> HTTP_PROXY=http://... HTTPS_PROXY=http://... ./clawrelay-api
+> ./clawrelay-api --proxy http://127.0.0.1:7890
 > ```
 
 > **Run in background (Linux/macOS):**
@@ -148,7 +161,11 @@ Returns available models.
   "data": [
     {"id": "vllm/claude-sonnet-4-6", "object": "model", "owned_by": "anthropic"},
     {"id": "vllm/claude-opus-4-6", "object": "model", "owned_by": "anthropic"},
-    {"id": "vllm/claude-haiku-4-5-20251001", "object": "model", "owned_by": "anthropic"}
+    {"id": "vllm/claude-haiku-4-5-20251001", "object": "model", "owned_by": "anthropic"},
+    {"id": "minimax/MiniMax-M2.7", "object": "model", "owned_by": "minimax"},
+    {"id": "minimax/MiniMax-M2.5", "object": "model", "owned_by": "minimax"},
+    {"id": "kimi/kimi-k2.5", "object": "model", "owned_by": "moonshot"},
+    {"id": "zhipu/glm-5.1", "object": "model", "owned_by": "zhipu"}
   ]
 }
 ```
@@ -224,13 +241,20 @@ clawrelay-api/
 
 ## Configuration
 
-The server currently uses hardcoded defaults. Customize by editing the source:
+Use command-line flags to customize the server at startup:
 
-| Setting | Location | Default |
+```bash
+./clawrelay-api --port 8080 --model MiniMax-M2.7 --proxy http://127.0.0.1:7890
+```
+
+| Setting | Flag | Default |
 |---|---|---|
-| Port | `main()` | `:50009` |
-| Default model | `defaultModel` | `vllm/claude-sonnet-4-6` |
-| Session log directory | `globalSessionStore.dir` | `sessions/` |
+| Port | `--port` | `50009` |
+| Default model | `--model` | `claude-sonnet-4-6` |
+| HTTP proxy | `--proxy` | — |
+| Session log directory | — | `sessions/` |
+
+The model name supports any provider — Claude, MiniMax, Kimi, GLM, etc. The client can also override the model per-request via the `model` field in the request body.
 
 ## License
 
@@ -309,9 +333,22 @@ go build -o clawrelay-api .
 Starting Claude OpenAI-compatible API server on :50009
 ```
 
+**命令行参数：**
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--port` | `50009` | 监听端口 |
+| `--model` | `claude-sonnet-4-6` | 默认模型名称（如 `MiniMax-M2.7`、`glm-5.1`） |
+| `--proxy` | — | HTTP/HTTPS 代理地址（如 `http://127.0.0.1:7890`） |
+
+> **使用其他模型：**
+> ```bash
+> ./clawrelay-api --model MiniMax-M2.7
+> ```
+
 > **需要代理？**
 > ```bash
-> HTTP_PROXY=http://... HTTPS_PROXY=http://... ./clawrelay-api
+> ./clawrelay-api --proxy http://127.0.0.1:7890
 > ```
 
 > **后台运行（Linux/macOS）：**
@@ -443,13 +480,20 @@ clawrelay-api/
 
 ## 配置
 
-服务目前使用硬编码的默认值，可通过修改源码自定义：
+通过命令行参数自定义服务：
 
-| 配置项 | 位置 | 默认值 |
+```bash
+./clawrelay-api --port 8080 --model MiniMax-M2.7 --proxy http://127.0.0.1:7890
+```
+
+| 配置项 | 参数 | 默认值 |
 |---|---|---|
-| 端口 | `main()` | `:50009` |
-| 默认模型 | `defaultModel` | `vllm/claude-sonnet-4-6` |
-| 会话日志目录 | `globalSessionStore.dir` | `sessions/` |
+| 端口 | `--port` | `50009` |
+| 默认模型 | `--model` | `claude-sonnet-4-6` |
+| HTTP 代理 | `--proxy` | — |
+| 会话日志目录 | — | `sessions/` |
+
+模型名称支持任意 provider — Claude、MiniMax、Kimi、GLM 等。客户端也可以通过请求体的 `model` 字段按请求覆盖默认模型。
 
 ## 许可证
 
