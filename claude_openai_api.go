@@ -329,17 +329,20 @@ var modelAliases = map[string]string{
 	"gpt-4o-mini":   "haiku",
 }
 
-const defaultModel = "vllm/claude-sonnet-4-6"
+var defaultModel = "vllm/claude-sonnet-4-6"
 
 var availableModels = []ModelInfo{
+	// Anthropic Claude
 	{ID: "vllm/claude-sonnet-4-6", Object: "model", Created: 1700000000, OwnedBy: "anthropic"},
-	{ID: "vllm/claude-sonnet-4-20250514", Object: "model", Created: 1700000000, OwnedBy: "anthropic"},
-	{ID: "vllm/sonnet", Object: "model", Created: 1700000000, OwnedBy: "anthropic"},
 	{ID: "vllm/claude-opus-4-6", Object: "model", Created: 1700000000, OwnedBy: "anthropic"},
-	{ID: "vllm/claude-opus-4-20250514", Object: "model", Created: 1700000000, OwnedBy: "anthropic"},
-	{ID: "vllm/opus", Object: "model", Created: 1700000000, OwnedBy: "anthropic"},
 	{ID: "vllm/claude-haiku-4-5-20251001", Object: "model", Created: 1700000000, OwnedBy: "anthropic"},
-	{ID: "vllm/haiku", Object: "model", Created: 1700000000, OwnedBy: "anthropic"},
+	// MiniMax
+	{ID: "minimax/MiniMax-M2.7", Object: "model", Created: 1700000000, OwnedBy: "minimax"},
+	{ID: "minimax/MiniMax-M2.5", Object: "model", Created: 1700000000, OwnedBy: "minimax"},
+	// Moonshot (Kimi)
+	{ID: "kimi/kimi-k2.5", Object: "model", Created: 1700000000, OwnedBy: "moonshot"},
+	// Zhipu (GLM)
+	{ID: "zhipu/glm-5.1", Object: "model", Created: 1700000000, OwnedBy: "zhipu"},
 }
 
 // CORS origins (same as claude_stream_api.go)
@@ -2066,7 +2069,13 @@ func writeOAIError(w http.ResponseWriter, statusCode int, errType string, messag
 func main() {
 	port := flag.String("port", "50009", "port to listen on")
 	proxy := flag.String("proxy", "", "HTTP/HTTPS proxy URL (e.g. http://127.0.0.1:7890)")
+	model := flag.String("model", "", "default model name (e.g. MiniMax-M2.7, claude-sonnet-4-6)")
 	flag.Parse()
+
+	if *model != "" {
+		defaultModel = *model
+		log.Printf("Default model set to: %s", defaultModel)
+	}
 
 	if *proxy != "" {
 		os.Setenv("HTTP_PROXY", *proxy)
