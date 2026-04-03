@@ -389,6 +389,14 @@ function autoScroll() {
 const initialEvents = {{.EventsJSON}};
 initialEvents.forEach(ev => renderEvent(ev));
 
+// After all inline events rendered, force scroll to bottom so userAtBottom stays true
+if (initialEvents.length > 0) {
+  requestAnimationFrame(() => {
+    window.scrollTo({ top: document.body.scrollHeight, behavior: 'instant' });
+    userAtBottom = true;
+  });
+}
+
 // Track last inline event timestamp for deduplication with WS history
 const lastInlineTs = initialEvents.length > 0
   ? initialEvents[initialEvents.length - 1].timestamp || ''
