@@ -384,20 +384,22 @@ func sessionPageHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Load session events and inline as JSON so content renders immediately
-	// without waiting for WebSocket connection
+	// without waiting for WebSocket connection.
+	// Use get() not getOrCreate() to avoid creating empty sessions on page view (DoS vector).
 	var eventsJSON string
-	entry := globalSessionStore.get(sessionID)
-	if entry == nil {
-		entry = globalSessionStore.getOrCreate(sessionID)
-	}
-	events := entry.Events()
-	if data, err := json.Marshal(events); err == nil {
-		eventsJSON = string(data)
+	if entry := globalSessionStore.get(sessionID); entry != nil {
+		events := entry.Events()
+		if data, err := json.Marshal(events); err == nil {
+			eventsJSON = string(data)
+		} else {
+			eventsJSON = "[]"
+		}
 	} else {
 		eventsJSON = "[]"
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store, private")
 	sessionViewerTmpl.Execute(w, struct {
 		SessionID  string
 		EventsJSON template.JS

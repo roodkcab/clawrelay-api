@@ -243,8 +243,11 @@ function connect() {
       wsHistoryDone = true;
       return;
     }
-    // Skip WebSocket history replay — already rendered from inline data
-    if (!wsHistoryDone) return;
+    // During WS history replay, skip events already rendered from inline data
+    // but render any newer events (arrived between HTTP snapshot and WS subscribe)
+    if (!wsHistoryDone) {
+      if (lastInlineTs && ev.timestamp && ev.timestamp <= lastInlineTs) return;
+    }
     renderEvent(ev);
   };
 }
@@ -384,8 +387,12 @@ function autoScroll() {
 
 // Render initial events from inline data (no WebSocket dependency)
 const initialEvents = {{.EventsJSON}};
-let initialEventCount = initialEvents.length;
 initialEvents.forEach(ev => renderEvent(ev));
+
+// Track last inline event timestamp for deduplication with WS history
+const lastInlineTs = initialEvents.length > 0
+  ? initialEvents[initialEvents.length - 1].timestamp || ''
+  : '';
 
 // Track whether WebSocket history replay is done
 let wsHistoryDone = false;
