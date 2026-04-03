@@ -219,8 +219,14 @@ function renderMarkdown(text) {
   try { return marked.parse(text); } catch(e) { return escHtml(text); }
 }
 
+let currentWs = null;
 function connect() {
+  if (currentWs && (currentWs.readyState === WebSocket.CONNECTING || currentWs.readyState === WebSocket.OPEN)) {
+    return; // Already connected or connecting
+  }
+  wsHistoryDone = false;
   const ws = new WebSocket(wsUrl);
+  currentWs = ws;
   ws.onopen = () => {
     statusDot.classList.add('connected');
     statusLabel.textContent = 'live';
@@ -228,11 +234,20 @@ function connect() {
   ws.onclose = () => {
     statusDot.classList.remove('connected');
     statusLabel.textContent = 'disconnected';
+    currentWs = null;
     setTimeout(connect, 3000);
   };
   ws.onmessage = (e) => {
     const ev = JSON.parse(e.data);
-    if (ev.type === 'history_end') return;
+    if (ev.type === 'history_end') {
+      wsHistoryDone = true;
+      return;
+    }
+    // During WS history replay, skip events already rendered from inline data
+    // but render any newer events (arrived between HTTP snapshot and WS subscribe)
+    if (!wsHistoryDone) {
+      if (lastInlineTs && ev.timestamp && ev.timestamp <= lastInlineTs) return;
+    }
     renderEvent(ev);
   };
 }
@@ -364,13 +379,32 @@ function autoScroll() {
 // Set auto-load hint based on browser language
 (function() {
   const lang = (navigator.language || '').toLowerCase();
-  let text = 'Auto-loading latest messages...';
-  if (lang.startsWith('zh')) text = '自动加载最新消息中...';
-  else if (lang.startsWith('ja')) text = '最新メッセージを自動読み込み中...';
+  let text = 'Waiting for new messages...';
+  if (lang.startsWith('zh')) text = '等待新消息...';
+  else if (lang.startsWith('ja')) text = '新しいメッセージを待機中...';
   autoLoadHint.textContent = text;
 })();
 
+// Render initial events from inline data (no WebSocket dependency)
+const initialEvents = {{.EventsJSON}};
+initialEvents.forEach(ev => renderEvent(ev));
+
+// Track last inline event timestamp for deduplication with WS history
+const lastInlineTs = initialEvents.length > 0
+  ? initialEvents[initialEvents.length - 1].timestamp || ''
+  : '';
+
+// Track whether WebSocket history replay is done
+let wsHistoryDone = false;
+
 connect();
+
+// Reconnect when page is restored from bfcache (back/forward navigation)
+window.addEventListener('pageshow', function(event) {
+  if (event.persisted) {
+    connect();
+  }
+});
 </script>
 </body>
 </html>
