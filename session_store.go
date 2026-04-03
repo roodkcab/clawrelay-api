@@ -383,8 +383,25 @@ func sessionPageHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Load session events and inline as JSON so content renders immediately
+	// without waiting for WebSocket connection
+	var eventsJSON string
+	entry := globalSessionStore.get(sessionID)
+	if entry == nil {
+		entry = globalSessionStore.getOrCreate(sessionID)
+	}
+	events := entry.Events()
+	if data, err := json.Marshal(events); err == nil {
+		eventsJSON = string(data)
+	} else {
+		eventsJSON = "[]"
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	sessionViewerTmpl.Execute(w, struct{ SessionID string }{sessionID})
+	sessionViewerTmpl.Execute(w, struct {
+		SessionID  string
+		EventsJSON template.JS
+	}{sessionID, template.JS(eventsJSON)})
 }
 
 // sessionListHandler serves a JSON list of all session IDs
