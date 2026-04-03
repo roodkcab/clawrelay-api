@@ -21,6 +21,8 @@ import (
 	"time"
 )
 
+var version = "dev"
+
 // ---- OpenAI-compatible request/response types ----
 
 type ChatCompletionRequest struct {
@@ -38,6 +40,7 @@ type ChatCompletionRequest struct {
 	EnvVars       map[string]string `json:"env_vars,omitempty"`
 	MaxTurns      *int              `json:"max_turns,omitempty"`
 	SessionID     string            `json:"session_id,omitempty"`
+	Effort        string            `json:"effort,omitempty"`
 }
 
 type StreamOptions struct {
@@ -910,6 +913,10 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		maxTurns = *req.MaxTurns
 	}
 	args = append(args, "--max-turns", fmt.Sprintf("%d", maxTurns))
+
+	if req.Effort != "" {
+		args = append(args, "--effort", req.Effort)
+	}
 
 	if req.SessionID != "" {
 		args = append(args, "--resume", req.SessionID)
@@ -2039,8 +2046,9 @@ func oaiHealthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"status": "healthy",
-		"claude": "available",
+		"status":  "healthy",
+		"claude":  "available",
+		"version": version,
 	})
 }
 
@@ -2070,7 +2078,13 @@ func main() {
 	port := flag.String("port", "50009", "port to listen on")
 	proxy := flag.String("proxy", "", "HTTP/HTTPS proxy URL (e.g. http://127.0.0.1:7890)")
 	model := flag.String("model", "", "default model name (e.g. MiniMax-M2.7, claude-sonnet-4-6)")
+	showVersion := flag.Bool("version", false, "show version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		os.Exit(0)
+	}
 
 	if *model != "" {
 		defaultModel = *model
