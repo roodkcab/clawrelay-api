@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-var version = "dev"
+var version = "1.0.0"
 
 // ---- OpenAI-compatible request/response types ----
 
@@ -161,7 +161,21 @@ type ClaudeEvent struct {
 	Event        json.RawMessage `json:"event,omitempty"` // for stream_event wrapper
 	Result       string          `json:"result,omitempty"`
 	Usage        *ClaudeUsage    `json:"usage,omitempty"`
-	TotalCostUSD float64         `json:"total_cost_usd,omitempty"`
+	// ModelUsage is the per-model token aggregation on the result event.
+	// Unlike Usage (main agent only), ModelUsage includes sub-agent token
+	// consumption dispatched via the Task/Agent tool. Claude Code CLI emits
+	// this as camelCase keys under each model name. See effectiveUsage().
+	ModelUsage   map[string]ClaudeModelUsage `json:"modelUsage,omitempty"`
+	TotalCostUSD float64                     `json:"total_cost_usd,omitempty"`
+}
+
+// ClaudeModelUsage is one entry of the result event's modelUsage map.
+// Keys are camelCase (CLI uses camelCase in modelUsage specifically).
+type ClaudeModelUsage struct {
+	InputTokens              int `json:"inputTokens"`
+	OutputTokens             int `json:"outputTokens"`
+	CacheCreationInputTokens int `json:"cacheCreationInputTokens"`
+	CacheReadInputTokens     int `json:"cacheReadInputTokens"`
 }
 
 // StreamAPIEvent represents the inner event of a stream_event wrapper,
@@ -298,6 +312,27 @@ func (s *tokenStats) Snapshot() TokenStatsSnapshot {
 		StartTime:     s.startTime.Format(time.RFC3339),
 		Uptime:        time.Since(s.startTime).Truncate(time.Second).String(),
 	}
+}
+
+// effectiveUsage returns the token usage to report for a result event. When
+// the CLI emits result.modelUsage (Claude Code >= 2.x), it is the source of
+// truth because it sums main agent + sub-agents (Task tool). Falls back to
+// result.usage (main agent only) for older CLI versions that omit modelUsage.
+func effectiveUsage(ev *ClaudeEvent) *ClaudeUsage {
+	if ev == nil {
+		return nil
+	}
+	if len(ev.ModelUsage) == 0 {
+		return ev.Usage
+	}
+	var out ClaudeUsage
+	for _, mu := range ev.ModelUsage {
+		out.InputTokens += mu.InputTokens
+		out.OutputTokens += mu.OutputTokens
+		out.CacheCreationInputTokens += mu.CacheCreationInputTokens
+		out.CacheReadInputTokens += mu.CacheReadInputTokens
+	}
+	return &out
 }
 
 // buildUsageInfo converts Claude's usage into OpenAI-compatible UsageInfo.
@@ -1181,9 +1216,9 @@ func runClaude(args []string, prompt string, workingDir string, envVars map[stri
 			if event.Result != "" {
 				result = event.Result
 			}
-			if event.Usage != nil {
-				usage = buildUsageInfo(event.Usage)
-				rawUsage = event.Usage
+			if eu := effectiveUsage(&event); eu != nil {
+				usage = buildUsageInfo(eu)
+				rawUsage = eu
 				costUSD = event.TotalCostUSD
 			}
 		}
@@ -1524,13 +1559,14 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 		}
 
 		if event.Type == "result" {
-			if event.Usage != nil {
-				globalStats.Record(model, event.Usage.InputTokens, event.Usage.OutputTokens,
-					event.Usage.CacheCreationInputTokens, event.Usage.CacheReadInputTokens, event.TotalCostUSD)
-				log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f",
-					model, event.Usage.InputTokens, event.Usage.OutputTokens,
-					event.Usage.CacheReadInputTokens, event.Usage.CacheCreationInputTokens, event.TotalCostUSD)
-				streamUsage = buildUsageInfo(event.Usage)
+			if eu := effectiveUsage(&event); eu != nil {
+				globalStats.Record(model, eu.InputTokens, eu.OutputTokens,
+					eu.CacheCreationInputTokens, eu.CacheReadInputTokens, event.TotalCostUSD)
+				log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f (subagents_included=%v)",
+					model, eu.InputTokens, eu.OutputTokens,
+					eu.CacheReadInputTokens, eu.CacheCreationInputTokens, event.TotalCostUSD,
+					len(event.ModelUsage) > 0)
+				streamUsage = buildUsageInfo(eu)
 			}
 
 			// finish_reason chunk (no usage here, vLLM style)
@@ -1808,13 +1844,14 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 				fullText.Reset()
 				fullText.WriteString(event.Result)
 			}
-			if event.Usage != nil {
-				finalUsage = buildUsageInfo(event.Usage)
-				globalStats.Record(model, event.Usage.InputTokens, event.Usage.OutputTokens,
-					event.Usage.CacheCreationInputTokens, event.Usage.CacheReadInputTokens, event.TotalCostUSD)
-				log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f",
-					model, event.Usage.InputTokens, event.Usage.OutputTokens,
-					event.Usage.CacheReadInputTokens, event.Usage.CacheCreationInputTokens, event.TotalCostUSD)
+			if eu := effectiveUsage(&event); eu != nil {
+				finalUsage = buildUsageInfo(eu)
+				globalStats.Record(model, eu.InputTokens, eu.OutputTokens,
+					eu.CacheCreationInputTokens, eu.CacheReadInputTokens, event.TotalCostUSD)
+				log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f (subagents_included=%v)",
+					model, eu.InputTokens, eu.OutputTokens,
+					eu.CacheReadInputTokens, eu.CacheCreationInputTokens, event.TotalCostUSD,
+					len(event.ModelUsage) > 0)
 			}
 		}
 	}
