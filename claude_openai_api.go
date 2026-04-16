@@ -36,11 +36,15 @@ type ChatCompletionRequest struct {
 	Stop          json.RawMessage `json:"stop,omitempty"`
 	Tools         []Tool          `json:"tools,omitempty"`
 	ToolChoice    json.RawMessage `json:"tool_choice,omitempty"`
-	WorkingDir    string            `json:"working_dir,omitempty"`
-	EnvVars       map[string]string `json:"env_vars,omitempty"`
-	MaxTurns      *int              `json:"max_turns,omitempty"`
-	SessionID     string            `json:"session_id,omitempty"`
-	Effort        string            `json:"effort,omitempty"`
+	WorkingDir      string            `json:"working_dir,omitempty"`
+	EnvVars         map[string]string `json:"env_vars,omitempty"`
+	MaxTurns        *int              `json:"max_turns,omitempty"`
+	SessionID       string            `json:"session_id,omitempty"`
+	Effort          string            `json:"effort,omitempty"`
+	SystemPrompt    string            `json:"system_prompt,omitempty"`    // → --system-prompt (相对 WorkingDir 的路径)
+	PermissionMode  string            `json:"permission_mode,omitempty"` // → --permission-mode (缺省 bypassPermissions)
+	AllowedTools    string            `json:"allowed_tools,omitempty"`   // → --allowedTools (逗号分隔, 如 "Read,Bash,Glob")
+	AddDirs         []string          `json:"add_dirs,omitempty"`        // → --add-dir (可多个)
 }
 
 type StreamOptions struct {
@@ -936,12 +940,30 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	if systemPrompt != "" {
 		args = append(args, "--append-system-prompt", systemPrompt)
 	}
+	if req.SystemPrompt != "" {
+		args = append(args, "--system-prompt", req.SystemPrompt)
+	}
 	args = append(args, "--model", model)
 	//args = append(args, "--betas", "context-1m-2025-08-07")
 	args = append(args, "--verbose")
 	args = append(args, "--output-format", "stream-json")
 	args = append(args, "--include-partial-messages")
-	args = append(args, "--permission-mode", "bypassPermissions")
+
+	// permission_mode: 调用方可指定, 缺省仍保持 bypassPermissions
+	permMode := "bypassPermissions"
+	if req.PermissionMode != "" {
+		permMode = req.PermissionMode
+	}
+	args = append(args, "--permission-mode", permMode)
+
+	if req.AllowedTools != "" {
+		args = append(args, "--allowedTools", req.AllowedTools)
+	}
+	for _, dir := range req.AddDirs {
+		if dir != "" {
+			args = append(args, "--add-dir", dir)
+		}
+	}
 
 	maxTurns := 200
 	if req.MaxTurns != nil {
