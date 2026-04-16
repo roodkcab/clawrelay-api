@@ -41,7 +41,7 @@ type ChatCompletionRequest struct {
 	MaxTurns        *int              `json:"max_turns,omitempty"`
 	SessionID       string            `json:"session_id,omitempty"`
 	Effort          string            `json:"effort,omitempty"`
-	SystemPrompt    string            `json:"system_prompt,omitempty"`    // → --system-prompt (相对 WorkingDir 的路径)
+	SystemPromptFile string           `json:"system_prompt_file,omitempty"` // → --append-system-prompt-file (相对 WorkingDir 的路径)
 	PermissionMode  string            `json:"permission_mode,omitempty"` // → --permission-mode (缺省 bypassPermissions)
 	AllowedTools    string            `json:"allowed_tools,omitempty"`   // → --allowedTools (逗号分隔, 如 "Read,Bash,Glob")
 	AddDirs         []string          `json:"add_dirs,omitempty"`        // → --add-dir (可多个)
@@ -863,6 +863,12 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
+var envVarsLogRedactor = regexp.MustCompile(`"env_vars"\s*:\s*\{[^}]*\}`)
+
+func sanitizeEnvVarsInLog(body string) string {
+	return envVarsLogRedactor.ReplaceAllString(body, `"env_vars":"[REDACTED]"`)
+}
+
 // ---- Handlers ----
 
 func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
@@ -881,10 +887,11 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		writeOAIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Failed to read body: %v", err))
 		return
 	}
-	if len(bodyBytes) <= 4096 {
-		log.Printf("Raw request body (%d bytes): %s", len(bodyBytes), string(bodyBytes))
+	logBody := sanitizeEnvVarsInLog(string(bodyBytes))
+	if len(logBody) <= 4096 {
+		log.Printf("Raw request body (%d bytes): %s", len(bodyBytes), logBody)
 	} else {
-		log.Printf("Raw request body (%d bytes): %s...[truncated]", len(bodyBytes), string(bodyBytes[:4096]))
+		log.Printf("Raw request body (%d bytes): %s...[truncated]", len(bodyBytes), logBody[:4096])
 	}
 
 	var req ChatCompletionRequest
@@ -940,8 +947,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	if systemPrompt != "" {
 		args = append(args, "--append-system-prompt", systemPrompt)
 	}
-	if req.SystemPrompt != "" {
-		args = append(args, "--system-prompt", req.SystemPrompt)
+	if req.SystemPromptFile != "" {
+		args = append(args, "--append-system-prompt-file", req.SystemPromptFile)
 	}
 	args = append(args, "--model", model)
 	//args = append(args, "--betas", "context-1m-2025-08-07")
