@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-var version = "1.0.0"
+var version = "1.0.1"
 
 // ---- OpenAI-compatible request/response types ----
 
@@ -1296,6 +1296,12 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 	fmt.Fprintf(w, ": ping\n\n")
 	flusher.Flush()
 
+	// Periodic SSE heartbeat so idle clients (aiohttp sock_read) can detect stuck upstreams.
+	// Claude CLI can go silent for minutes on a blocked tool call, which otherwise makes
+	// the client wait for the full aiohttp `total` timeout.
+	heartbeatTicker := time.NewTicker(30 * time.Second)
+	defer heartbeatTicker.Stop()
+
 	var streamDeltaSent bool // true if we've sent any stream_event deltas
 	var streamUsage *UsageInfo // captured from result event for session logging
 	seenToolNames := map[string]bool{} // deduplicate tool_call chunks across both detection paths
@@ -1341,7 +1347,22 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 	}
 	toolBlocks := map[int]*toolBlock{}
 
-	for line := range lines {
+processLines:
+	for {
+		var line string
+		var ok bool
+		select {
+		case <-r.Context().Done():
+			return
+		case <-heartbeatTicker.C:
+			fmt.Fprintf(w, ": keepalive\n\n")
+			flusher.Flush()
+			continue
+		case line, ok = <-lines:
+			if !ok {
+				break processLines
+			}
+		}
 		if line == "" {
 			continue
 		}
@@ -1675,6 +1696,10 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 	fmt.Fprintf(w, ": ping\n\n")
 	flusher.Flush()
 
+	// Periodic SSE heartbeat so idle clients (aiohttp sock_read) can detect stuck upstreams.
+	heartbeatTicker := time.NewTicker(30 * time.Second)
+	defer heartbeatTicker.Stop()
+
 	// Track text and native tool_use blocks from Claude CLI's stream.
 	var fullText strings.Builder
 	var filter toolCallFilter
@@ -1689,7 +1714,22 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 	// AskUserQuestion tracking
 	var askUserIdx int = -1 // index of AskUserQuestion content block, -1 if none
 
-	for line := range lines {
+processLines:
+	for {
+		var line string
+		var ok bool
+		select {
+		case <-r.Context().Done():
+			return
+		case <-heartbeatTicker.C:
+			fmt.Fprintf(w, ": keepalive\n\n")
+			flusher.Flush()
+			continue
+		case line, ok = <-lines:
+			if !ok {
+				break processLines
+			}
+		}
 		if line == "" {
 			continue
 		}
