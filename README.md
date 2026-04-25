@@ -4,19 +4,25 @@
 
 ---
 
-> A lightweight Go server that turns **Claude Code CLI** into an **OpenAI-compatible API** — just point any client at it and get full Claude Code power (file editing, Bash, web search, MCP, etc.) over HTTP/SSE.
+> A pair of lightweight Go relays that turn **Claude Code CLI** and **OpenAI Codex CLI** into **OpenAI-compatible HTTP APIs** — any OpenAI client (curl, ClawRelay desktop/iOS, WeCom/Feishu bots, etc.) can talk to either via the same SSE protocol, while each relay internally exploits its CLI's native features.
 
 ```
-┌──────────────────────────┐
-│        Clients           │
-│                          │
-│  WeCom Bot               │
-│  Feishu Bot              │       ┌──────────────┐       ┌──────────────┐
-│  ClawRelay Desktop/iOS   │──────▶│ clawrelay-api│──────▶│  claude CLI  │
-│  Any OpenAI client       │ HTTP  │   (:50009)   │ spawn │              │
-│  curl                    │  SSE  │              │       │  Anthropic   │
-└──────────────────────────┘       └──────────────┘       └──────────────┘
+                                ┌──────────────────┐       ┌──────────────┐
+                          ┌────▶│ relay-claude     │──────▶│  claude CLI  │
+┌──────────────────────┐  │     │   (:50009)       │ spawn │  → Anthropic │
+│      Clients         │  │     └──────────────────┘       └──────────────┘
+│                      │  │
+│  WeCom / Feishu Bot  │──┤
+│  ClawRelay Desktop   │  │     ┌──────────────────┐       ┌──────────────┐
+│  Any OpenAI client   │  └────▶│ relay-codex      │──────▶│  codex CLI   │
+└──────────────────────┘ HTTP   │   (:50010)       │ spawn │   → OpenAI   │
+                          SSE   └──────────────────┘       └──────────────┘
 ```
+
+Both relays share the same OpenAI-compatible request/response shape and `/sessions` viewer. They differ in what's behind the curtain:
+
+- **relay-claude** — full Claude Code feature surface: native tool_use, AskUserQuestion, --append-system-prompt, --resume, modelUsage sub-agent token rollup, token-level streaming.
+- **relay-codex** — native OpenAI Codex features: thread-based resume (sends only the new user message on follow-up turns, big token savings on long conversations), native `-i FILE` multimodal attachments, `model_reasoning_effort` config override, sandbox/approval modes, command_execution surfaced as tool_calls for UI indicators.
 
 ## Clients
 
@@ -57,23 +63,25 @@ Claude Code is a powerful agentic CLI, but it has no HTTP API. This server bridg
 ```bash
 git clone https://github.com/roodkcab/clawrelay-api.git
 cd clawrelay-api
-go build -o clawrelay-api .
-./clawrelay-api
+
+# Build whichever relays you need (both share pkg/openai + pkg/sessions).
+go build -o relay-claude ./cmd/relay-claude
+go build -o relay-codex  ./cmd/relay-codex
+
+# Default ports: claude on 50009, codex on 50010 — run only what you need.
+./relay-claude &
+./relay-codex  &
 ```
 
-Output:
+**Common flags (apply to both binaries):**
 
-```
-Starting Claude OpenAI-compatible API server on :50009
-```
-
-**Command-line flags:**
-
-| Flag | Default | Description |
-|---|---|---|
-| `--port` | `50009` | Port to listen on |
-| `--model` | `claude-sonnet-4-6` | Default model name (e.g. `MiniMax-M2.7`, `glm-5.1`) |
-| `--proxy` | — | HTTP/HTTPS proxy URL (e.g. `http://127.0.0.1:7890`) |
+| Flag | relay-claude default | relay-codex default | Description |
+|---|---|---|---|
+| `--port` | `50009` | `50010` | Port to listen on |
+| `--model` | `claude-sonnet-4-6` | `gpt-5.4` | Default model when client omits one |
+| `--proxy` | — | — | HTTP/HTTPS proxy URL |
+| `--sessions-dir` | `sessions` | `sessions` | Where session logs + attachments live (point both relays at the same dir to share `/sessions` viewer) |
+| `--log-file` | `relay-claude.log` | `relay-codex.log` | Log file (use `-` for stdout only) |
 
 > **Use a different model provider:**
 > ```bash
@@ -233,11 +241,20 @@ Sessions are stored as JSONL files in the `sessions/` directory. Each event (req
 
 ```
 clawrelay-api/
-├── claude_openai_api.go   Main server: types, handlers, stream translation, CLI launcher
-├── session_store.go       Session persistence, WebSocket viewer, HTML UI
-├── go.mod                 Module definition (Go 1.24, gorilla/websocket)
-└── go.sum                 Dependency checksums
+├── pkg/
+│   ├── openai/         OpenAI-compatible types, SSE/CORS helpers, lifetime token stats
+│   ├── sessions/       Append-only session store + WebSocket-streamed HTML viewer
+│   └── attachments/    base64 image/file decoder with content-hash dedup
+├── cmd/
+│   ├── relay-claude/   Claude Code CLI driver: stream-json parsing, native tool_use,
+│   │                   AskUserQuestion handling, --resume retry, modelUsage rollup
+│   └── relay-codex/    Codex CLI driver: native thread_id resume (token savings),
+│                       -i FILE attachments, reasoning.effort, sandbox/approval modes
+├── go.mod              Single Go module (1.24, gorilla/websocket)
+└── go.sum
 ```
+
+Both binaries link the same shared packages, so behavioral changes to session storage / OpenAI types only need a single edit.
 
 ## Configuration
 
@@ -270,19 +287,25 @@ The model name supports any provider — Claude, MiniMax, Kimi, GLM, etc. The cl
 
 ---
 
-> 一个轻量级 Go 服务，将 **Claude Code CLI** 转化为 **OpenAI 兼容的 API** — 任何客户端直接对接即可获得完整的 Claude Code 能力（文件编辑、Bash、网络搜索、MCP 等）。
+> 两个轻量级 Go 中继服务，分别将 **Claude Code CLI** 和 **OpenAI Codex CLI** 转化为 **OpenAI 兼容 HTTP API**。两个服务对外协议风格一致（同一套 OpenAI SSE），对内各自榨干所属 CLI 的原生特性。
 
 ```
-┌──────────────────────────┐
-│          客户端           │
-│                          │
-│  企业微信机器人            │
-│  飞书机器人               │       ┌──────────────┐       ┌──────────────┐
-│  ClawRelay 桌面端/iOS     │──────▶│ clawrelay-api│──────▶│  claude CLI  │
-│  任意 OpenAI 客户端       │ HTTP  │   (:50009)   │ 子进程│              │
-│  curl                    │  SSE  │              │       │  Anthropic   │
-└──────────────────────────┘       └──────────────┘       └──────────────┘
+                                ┌──────────────────┐       ┌──────────────┐
+                          ┌────▶│ relay-claude     │──────▶│  claude CLI  │
+┌──────────────────────┐  │     │   (:50009)       │ 子进程│   → Anthropic│
+│        客户端         │  │     └──────────────────┘       └──────────────┘
+│                      │  │
+│  企业微信 / 飞书机器人  │──┤
+│  ClawRelay 桌面端     │  │     ┌──────────────────┐       ┌──────────────┐
+│  任意 OpenAI 客户端   │  └────▶│ relay-codex      │──────▶│  codex CLI   │
+└──────────────────────┘ HTTP   │   (:50010)       │ 子进程│   → OpenAI   │
+                          SSE   └──────────────────┘       └──────────────┘
 ```
+
+两个服务共享同一套 OpenAI 兼容请求/响应结构和 `/sessions` 查看器。差异在底层：
+
+- **relay-claude** — 完整保留 Claude Code 能力面：原生 tool_use、AskUserQuestion、--append-system-prompt、--resume、modelUsage 子代理 token 汇总、token 级流式。
+- **relay-codex** — 原生 OpenAI Codex 特性：基于 thread_id 的 resume（后续轮次只发送最新 user message，长会话下大幅节省 token）、原生 `-i FILE` 多模态附件、`model_reasoning_effort` 配置透传、精确的 sandbox/approval 模式映射、command_execution 通过 tool_calls 上抛供 UI 显示进度。
 
 ## 客户端
 
@@ -312,34 +335,34 @@ Claude Code 是强大的智能体 CLI，但没有 HTTP API。本服务补上了�
 ### 环境要求
 
 - [Go 1.21+](https://go.dev/dl/)
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) 已安装且在 PATH 中
-  ```bash
-  npm install -g @anthropic-ai/claude-code
-  ```
-- Claude Code 已配置有效的 Anthropic API Key
+- 任选其一或全装：
+  - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)：`npm install -g @anthropic-ai/claude-code`（用于 relay-claude）
+  - [OpenAI Codex CLI](https://github.com/openai/codex)：`brew install codex` 或参见上游文档（用于 relay-codex）
 
 ### 编译运行
 
 ```bash
 git clone https://github.com/roodkcab/clawrelay-api.git
 cd clawrelay-api
-go build -o clawrelay-api .
-./clawrelay-api
+
+# 按需编译；两个 binary 都会复用 pkg/openai + pkg/sessions 共享代码。
+go build -o relay-claude ./cmd/relay-claude
+go build -o relay-codex  ./cmd/relay-codex
+
+# 默认端口：claude 50009，codex 50010；只跑你需要的。
+./relay-claude &
+./relay-codex  &
 ```
 
-输出：
+**通用参数（两个 binary 都支持）：**
 
-```
-Starting Claude OpenAI-compatible API server on :50009
-```
-
-**命令行参数：**
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--port` | `50009` | 监听端口 |
-| `--model` | `claude-sonnet-4-6` | 默认模型名称（如 `MiniMax-M2.7`、`glm-5.1`） |
-| `--proxy` | — | HTTP/HTTPS 代理地址（如 `http://127.0.0.1:7890`） |
+| 参数 | relay-claude 默认 | relay-codex 默认 | 说明 |
+|---|---|---|---|
+| `--port` | `50009` | `50010` | 监听端口 |
+| `--model` | `claude-sonnet-4-6` | `gpt-5.4` | 客户端未指定时的默认模型 |
+| `--proxy` | — | — | HTTP/HTTPS 代理地址 |
+| `--sessions-dir` | `sessions` | `sessions` | 会话日志和附件目录（两个服务指向同一目录可共用 `/sessions` 查看器） |
+| `--log-file` | `relay-claude.log` | `relay-codex.log` | 日志文件路径（设为 `-` 仅输出 stdout） |
 
 > **使用其他模型：**
 > ```bash
@@ -472,11 +495,20 @@ WebSocket 端点：`ws://host:50009/session/{id}/ws`
 
 ```
 clawrelay-api/
-├── claude_openai_api.go   主服务：类型定义、请求处理、流式转换、CLI 启动器
-├── session_store.go       会话持久化、WebSocket 查看器、HTML 界面
-├── go.mod                 模块定义（Go 1.24, gorilla/websocket）
-└── go.sum                 依赖校验
+├── pkg/
+│   ├── openai/         OpenAI 兼容类型、SSE/CORS 工具、token 用量统计
+│   ├── sessions/       会话存储 + WebSocket 查看器 + HTML 界面
+│   └── attachments/    base64 图片/文件解码 + 内容哈希去重
+├── cmd/
+│   ├── relay-claude/   Claude Code CLI 驱动：stream-json 解析、原生 tool_use、
+│   │                   AskUserQuestion 处理、--resume 重试、modelUsage 子代理汇总
+│   └── relay-codex/    Codex CLI 驱动：原生 thread_id resume（节省 token）、
+│                       原生 -i FILE 多模态附件、reasoning.effort、sandbox/approval 模式
+├── go.mod              单 Go module（1.24, gorilla/websocket）
+└── go.sum
 ```
+
+两个 binary 共用同一份共享包，会话存储 / OpenAI 类型等共性逻辑只需改一处即可。
 
 ## 配置
 

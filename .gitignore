@@ -7,3 +7,7 @@ bin
 /claude_openai_api_linux_amd64
 /clawrelay-api
 /clawrelay-api_linux_amd64
+/relay-claude
+/relay-codex
+/sessions/
+/.gstack/
