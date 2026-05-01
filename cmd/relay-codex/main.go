@@ -30,7 +30,7 @@ import (
 	"clawrelay-api/pkg/sessions"
 )
 
-var version = "1.1.1"
+var version = "1.1.2"
 
 var defaultModel = "codex/gpt-5.5"
 

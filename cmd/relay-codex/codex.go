@@ -107,23 +107,6 @@ func buildCodexInput(req *openai.ChatCompletionRequest, model string, threadID, 
 		out.Args = append(out.Args, "-c", "model_reasoning_effort="+req.Effort)
 	}
 
-	// On a fresh session, set instructions via -c so codex treats them as
-	// system-level (rather than appending them visibly to the user prompt).
-	// When resuming, the original session's instructions are already retained
-	// server-side, so re-sending them would just stuff context unnecessarily.
-	if !out.isResume() {
-		// Extract first system message; we'll set it as instructions.
-		for _, msg := range req.Messages {
-			if msg.Role == "system" {
-				if sp := msg.ContentString(); sp != "" {
-					// codex parses -c values as TOML, so we must stringify.
-					out.Args = append(out.Args, "-c", "instructions="+tomlString(sp))
-				}
-				break
-			}
-		}
-	}
-
 	// Compose the prompt body and gather image attachments from the user
 	// messages. On resume we only care about the *latest* user turn; on a
 	// fresh start we need the whole history flattened so codex sees it.
@@ -132,6 +115,19 @@ func buildCodexInput(req *openai.ChatCompletionRequest, model string, threadID, 
 		out.Stdin, out.ImagePath = lastUserMessage(req.Messages, sessionDir)
 	} else {
 		out.Stdin, out.ImagePath = flattenForFreshSession(req.Messages, sessionDir)
+	}
+
+	// Prepend system messages on every turn (fresh + resume). We previously
+	// tried `-c instructions=...` but codex 0.125+ silently ignores that path,
+	// which meant upstream-provided rules (security policies, per-user identity)
+	// were being dropped entirely. Re-injecting on every turn is intentional:
+	// codex doesn't carry custom system prompts across resumes, and the upstream
+	// may rewrite the identity portion ([SYS_USER]) per turn.
+	if sysBlock := joinSystemMessages(req.Messages); sysBlock != "" {
+		out.Stdin = "<system_rules priority=\"highest\">\n" +
+			sysBlock +
+			"\n</system_rules>\n\n" +
+			out.Stdin
 	}
 
 	// Image attachments via codex's native `-i FILE` mechanism. This is
@@ -150,42 +146,28 @@ func buildCodexInput(req *openai.ChatCompletionRequest, model string, threadID, 
 
 func (c codexInput) isResume() bool { return c.IsResume }
 
+// joinSystemMessages concatenates every system message in the request into a
+// single block, separated by blank lines. Returns "" if there are none. Used
+// to build the <system_rules> sentinel block that gets prepended to stdin.
+func joinSystemMessages(messages []openai.ChatMessage) string {
+	var parts []string
+	for _, msg := range messages {
+		if msg.Role != "system" {
+			continue
+		}
+		if sp := msg.ContentString(); sp != "" {
+			parts = append(parts, sp)
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
 // stripPrefix turns `codex/gpt-5.4` into `gpt-5.4`.
 func stripPrefix(model string) string {
 	if idx := strings.LastIndex(model, "/"); idx >= 0 {
 		return model[idx+1:]
 	}
 	return model
-}
-
-// tomlString quotes a value for safe inclusion in a `-c key=value` override.
-// Codex parses the value as TOML, so a bare string with newlines or quotes
-// would mis-parse. We wrap in TOML's basic-string form with escaping.
-func tomlString(s string) string {
-	var b strings.Builder
-	b.WriteByte('"')
-	for _, r := range s {
-		switch r {
-		case '\\':
-			b.WriteString(`\\`)
-		case '"':
-			b.WriteString(`\"`)
-		case '\n':
-			b.WriteString(`\n`)
-		case '\r':
-			b.WriteString(`\r`)
-		case '\t':
-			b.WriteString(`\t`)
-		default:
-			if r < 0x20 {
-				b.WriteString(fmt.Sprintf(`\u%04X`, r))
-			} else {
-				b.WriteRune(r)
-			}
-		}
-	}
-	b.WriteByte('"')
-	return b.String()
 }
 
 // lastUserMessage extracts the most recent user message's text and image
@@ -217,16 +199,16 @@ func lastUserMessage(messages []openai.ChatMessage, sessionDir string) (text str
 }
 
 // flattenForFreshSession converts the OpenAI message array into a single
-// prompt for the first turn of a brand-new codex session. We omit the system
-// message (already passed via -c instructions) and use a clean dialogue
-// format that matches GPT's native expectation better than the Claude-style
-// "Human:/Assistant:" markers.
+// prompt for the first turn of a brand-new codex session. System messages
+// are skipped here — they're injected by buildCodexInput as a sentinel
+// <system_rules> block prepended to the final stdin payload.
 func flattenForFreshSession(messages []openai.ChatMessage, sessionDir string) (prompt string, images []string) {
 	var parts []string
 	for _, msg := range messages {
 		switch msg.Role {
 		case "system":
-			// Already passed via -c instructions; skip.
+			// Handled by buildCodexInput's <system_rules> prepend; skip here
+			// to avoid duplicating system content into the dialogue body.
 			continue
 		case "user":
 			text := msg.ContentString()
