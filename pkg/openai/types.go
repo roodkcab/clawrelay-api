@@ -34,6 +34,7 @@ type ChatCompletionRequest struct {
 	PermissionMode   string            `json:"permission_mode,omitempty"`
 	AllowedTools     string            `json:"allowed_tools,omitempty"` // comma-separated
 	AddDirs          []string          `json:"add_dirs,omitempty"`
+	Settings         string            `json:"settings,omitempty"` // JSON string passed verbatim to `claude --settings` (shallow-merged into existing settings.json)
 }
 
 type StreamOptions struct {
