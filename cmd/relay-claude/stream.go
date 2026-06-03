@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"clawrelay-api/pkg/openai"
+	"clawrelay-api/pkg/proc"
 )
 
 // handleStreamResponse streams Claude output without tool-call detection.
@@ -20,13 +21,8 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 		return
 	}
 
-	go func() {
-		<-r.Context().Done()
-		if cmd := *cmdPtr; cmd != nil && cmd.Process != nil {
-			log.Printf("Client disconnected, killing Claude process pid=%d", cmd.Process.Pid)
-			cmd.Process.Kill()
-		}
-	}()
+	// Disconnect handling is inline in the loop below (single goroutine
+	// watching ctx), so there is no watcher/loop race on ctx.
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -37,6 +33,10 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		log.Printf("Streaming not supported")
+		if cmd := *cmdPtr; cmd != nil {
+			proc.KillGroup(cmd)
+		}
+		proc.DrainLines(lines)
 		return
 	}
 
@@ -94,6 +94,10 @@ processLines:
 		var ok bool
 		select {
 		case <-r.Context().Done():
+			if cmd := *cmdPtr; cmd != nil {
+				proc.KillGroup(cmd) // disconnect: kill the still-running group
+			}
+			proc.DrainLines(lines)
 			return
 		case <-heartbeatTicker.C:
 			fmt.Fprintf(w, ": keepalive\n\n")
@@ -250,13 +254,10 @@ processLines:
 				flusher.Flush()
 
 				if cmd := *cmdPtr; cmd != nil && cmd.Process != nil {
-					log.Printf("[ASK_USER_QUESTION] killing Claude process pid=%d", cmd.Process.Pid)
-					cmd.Process.Kill()
+					log.Printf("[ASK_USER_QUESTION] killing Claude process group pid=%d", cmd.Process.Pid)
+					proc.KillGroup(cmd)
 				}
-				go func() {
-					for range lines {
-					}
-				}()
+				proc.DrainLines(lines)
 				return
 			}
 			continue
@@ -374,13 +375,8 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 		return
 	}
 
-	go func() {
-		<-r.Context().Done()
-		if cmd := *cmdPtr; cmd != nil && cmd.Process != nil {
-			log.Printf("Client disconnected, killing Claude process pid=%d", cmd.Process.Pid)
-			cmd.Process.Kill()
-		}
-	}()
+	// Disconnect handling is inline in the loop below (single goroutine
+	// watching ctx), so there is no watcher/loop race on ctx.
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -391,6 +387,10 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		log.Printf("Streaming not supported")
+		if cmd := *cmdPtr; cmd != nil {
+			proc.KillGroup(cmd)
+		}
+		proc.DrainLines(lines)
 		return
 	}
 
@@ -415,6 +415,10 @@ processLines:
 		var ok bool
 		select {
 		case <-r.Context().Done():
+			if cmd := *cmdPtr; cmd != nil {
+				proc.KillGroup(cmd) // disconnect: kill the still-running group
+			}
+			proc.DrainLines(lines)
 			return
 		case <-heartbeatTicker.C:
 			fmt.Fprintf(w, ": keepalive\n\n")
@@ -507,8 +511,8 @@ processLines:
 					flusher.Flush()
 
 					if cmd := *cmdPtr; cmd != nil && cmd.Process != nil {
-						log.Printf("[ASK_USER_QUESTION] killing Claude process pid=%d", cmd.Process.Pid)
-						cmd.Process.Kill()
+						log.Printf("[ASK_USER_QUESTION] killing Claude process group pid=%d", cmd.Process.Pid)
+						proc.KillGroup(cmd)
 					}
 					go func() {
 						for range lines {

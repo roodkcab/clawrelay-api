@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"clawrelay-api/pkg/openai"
+	"clawrelay-api/pkg/proc"
 )
 
 // cleanEnv returns the current environment with CLAUDECODE removed (the
@@ -104,6 +105,9 @@ func buildClaudeArgs(req *openai.ChatCompletionRequest, model, prompt, systemPro
 // marker was seen — used to drive the resume-retry path.
 func launchClaude(args []string, prompt, workingDir string, envVars map[string]string) (*exec.Cmd, <-chan string, <-chan bool, error) {
 	cmd := exec.Command("claude", args...)
+	// Own process group so KillGroup can reap the whole tree (node wrapper +
+	// native claude binary) instead of orphaning the native child.
+	proc.SetNewProcessGroup(cmd)
 	cmd.Env = cleanEnv(envVars)
 	if workingDir != "" {
 		cmd.Dir = workingDir

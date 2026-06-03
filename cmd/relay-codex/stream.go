@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os/exec"
 	"strings"
 	"time"
 
 	"clawrelay-api/pkg/openai"
+	"clawrelay-api/pkg/proc"
 )
 
 // handleStreamResponse pipes codex JSONL events through to the client as an
@@ -29,14 +31,8 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, input codexInp
 		return
 	}
 
-	// Kill subprocess if client drops the SSE connection.
-	go func() {
-		<-r.Context().Done()
-		if cmd != nil && cmd.Process != nil {
-			log.Printf("Client disconnected, killing codex process pid=%d", cmd.Process.Pid)
-			cmd.Process.Kill()
-		}
-	}()
+	// Disconnect handling is inline in the processLines loop below (single
+	// goroutine watching ctx), so there is no watcher/loop race on ctx.
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -47,6 +43,8 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, input codexInp
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		log.Printf("Streaming not supported by ResponseWriter")
+		proc.KillGroup(cmd)
+		proc.DrainLines(lines)
 		return
 	}
 
@@ -129,6 +127,8 @@ processLines:
 		var ok bool
 		select {
 		case <-r.Context().Done():
+			proc.KillGroup(cmd)    // disconnect: process is still running, safe to kill
+			proc.DrainLines(lines) // unblock producer so it reaches cmd.Wait()
 			return
 		case <-heartbeat.C:
 			fmt.Fprintf(w, ": keepalive\n\n")
@@ -265,12 +265,7 @@ func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, input codex
 		return
 	}
 
-	go func() {
-		<-r.Context().Done()
-		if cmd != nil && cmd.Process != nil {
-			cmd.Process.Kill()
-		}
-	}()
+	defer proc.WatchDisconnect(r.Context(), func() *exec.Cmd { return cmd }, lines)()
 
 	var (
 		fullText  strings.Builder
