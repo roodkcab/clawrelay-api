@@ -80,7 +80,7 @@ func buildClaudeArgs(req *openai.ChatCompletionRequest, model, prompt, systemPro
 		}
 	}
 
-	maxTurns := 200
+	maxTurns := 20
 	if req.MaxTurns != nil {
 		maxTurns = *req.MaxTurns
 	}
@@ -88,6 +88,9 @@ func buildClaudeArgs(req *openai.ChatCompletionRequest, model, prompt, systemPro
 
 	if req.Effort != "" {
 		args = append(args, "--effort", req.Effort)
+	}
+	if req.Settings != "" {
+		args = append(args, "--settings", req.Settings)
 	}
 	if req.SessionID != "" {
 		args = append(args, "--resume", req.SessionID)
