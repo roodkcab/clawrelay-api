@@ -11,6 +11,7 @@ import (
 
 	"clawrelay-api/pkg/attachments"
 	"clawrelay-api/pkg/openai"
+	"clawrelay-api/pkg/proc"
 )
 
 // cleanEnv mirrors the Claude relay's helper but strips CODEX_* job-control
@@ -246,6 +247,9 @@ func flattenForFreshSession(messages []openai.ChatMessage, sessionDir string) (p
 // merged into the inherited environment minus codex bookkeeping vars.
 func launchCodex(input codexInput, workingDir string, envExtra map[string]string) (*exec.Cmd, <-chan string, error) {
 	cmd := exec.Command("codex", input.Args...)
+	// Own process group so KillGroup can reap the whole tree (node wrapper +
+	// native codex binary) instead of orphaning the native child.
+	proc.SetNewProcessGroup(cmd)
 	cmd.Env = cleanEnv(envExtra)
 	if workingDir != "" {
 		cmd.Dir = workingDir
