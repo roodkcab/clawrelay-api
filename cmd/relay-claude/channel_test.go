@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -37,8 +39,8 @@ func (b *bufWriteCloser) String() string {
 
 func TestDrainStdoutTurnBoundary(t *testing.T) {
 	w := &chanWorker{ready: make(chan struct{})}
-	lines := make(chan string, 64)
-	w.curLines = lines
+	a := &activeTurn{lines: make(chan string, 64), quit: make(chan struct{})}
+	w.cur = a
 
 	input := strings.Join([]string{
 		`{"type":"system","subtype":"init","session_id":"sid-123"}`,
@@ -51,7 +53,7 @@ func TestDrainStdoutTurnBoundary(t *testing.T) {
 	go w.drainStdout(strings.NewReader(input))
 
 	var got []string
-	for l := range lines { // closes after the result line
+	for l := range a.lines { // closes after the result line
 		got = append(got, l)
 	}
 
@@ -93,18 +95,93 @@ func TestDrainStdoutClosesTurnOnProcessExit(t *testing.T) {
 	// If the process dies mid-turn (no result), drainStdout must still close
 	// the active turn channel so the handler unblocks.
 	w := &chanWorker{ready: make(chan struct{})}
-	lines := make(chan string, 8)
-	w.curLines = lines
+	a := &activeTurn{lines: make(chan string, 8), quit: make(chan struct{})}
+	w.cur = a
 	input := `{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}}` + "\n"
 
 	go w.drainStdout(strings.NewReader(input)) // EOF after one line, no result
 
 	var got []string
-	for l := range lines { // must close via the defer on EOF
+	for l := range a.lines { // must close via the defer on EOF
 		got = append(got, l)
 	}
 	if len(got) != 1 {
 		t.Fatalf("expected 1 forwarded line before EOF, got %d", len(got))
+	}
+}
+
+// blockingReader emits `head` then blocks on a release channel, then EOFs. It
+// keeps drainStdout's scanner alive so a parked send can be observed.
+type blockingReader struct {
+	head    []byte
+	off     int
+	release chan struct{}
+	done    bool
+}
+
+func (b *blockingReader) Read(p []byte) (int, error) {
+	if b.off < len(b.head) {
+		n := copy(p, b.head[b.off:])
+		b.off += n
+		return n, nil
+	}
+	if !b.done {
+		<-b.release
+		b.done = true
+	}
+	return 0, io.EOF
+}
+
+// TestAbandonWhileParkedNoPanic is the regression guard for the critical
+// send-on-closed race: drainStdout parks on a full-buffer send, then a
+// concurrent abandon (as the cmd.Wait waiter / kill would do) must unblock it
+// and close `lines` WITHOUT a "send on closed channel" panic.
+func TestAbandonWhileParkedNoPanic(t *testing.T) {
+	for iter := 0; iter < 50; iter++ {
+		w := &chanWorker{ready: make(chan struct{})}
+		a := &activeTurn{lines: make(chan string, 1), quit: make(chan struct{})}
+		w.cur = a
+
+		// 20 non-result lines into a 1-slot buffer with no consumer → drainStdout
+		// parks on the send almost immediately.
+		var sb strings.Builder
+		for i := 0; i < 20; i++ {
+			sb.WriteString(`{"type":"stream_event"}` + "\n")
+		}
+		br := &blockingReader{head: []byte(sb.String()), release: make(chan struct{})}
+
+		done := make(chan struct{})
+		go func() { w.drainStdout(br); close(done) }()
+
+		time.Sleep(2 * time.Millisecond) // let it park on the send
+		w.abandonActiveTurn(nil)         // waiter/kill path: must not panic
+		close(br.release)                // allow EOF
+
+		for range a.lines { // drain; must be closed, never panic
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("drainStdout did not exit after abandon")
+		}
+	}
+}
+
+func TestReaperSkipsInTurnWorker(t *testing.T) {
+	m := newChanManager(chanManagerConfig{IdleTTL: time.Minute})
+	busy := newWorkerAt("busy", time.Now().Add(-2*time.Minute)) // stale lastUsed
+	busy.inTurn.Store(true)                                     // but actively streaming
+	idle := newWorkerAt("idle", time.Now().Add(-2*time.Minute))
+	m.workers["busy"] = busy
+	m.workers["idle"] = idle
+
+	m.reapOnce()
+
+	if _, ok := m.workers["busy"]; !ok {
+		t.Fatal("a worker mid-turn must NOT be reaped even with stale lastUsed")
+	}
+	if _, ok := m.workers["idle"]; ok {
+		t.Fatal("an idle worker should still be reaped")
 	}
 }
 
@@ -155,6 +232,58 @@ func TestBeginTurnFailsWhenDead(t *testing.T) {
 	w.dead.Store(true)
 	if _, err := w.beginTurn("x"); err == nil {
 		t.Fatal("beginTurn should fail on a dead worker")
+	}
+}
+
+// Regression for the round-2 #1 fix: the write can succeed on a child that just
+// exited; if deadCh is already closed, beginTurn must fail fast (no live
+// drainStdout to ever close the returned lines) and release turnMu.
+func TestBeginTurnFailsIfDiedAfterWrite(t *testing.T) {
+	w := &chanWorker{stdin: &bufWriteCloser{}, deadCh: make(chan struct{})}
+	close(w.deadCh) // process exited, but dead flag not yet set → initial check passes
+	if _, err := w.beginTurn("hi"); err == nil {
+		t.Fatal("beginTurn must fail when the process died right after the write")
+	}
+	if !w.turnMu.TryLock() {
+		t.Fatal("turnMu must be released after a fast-fail")
+	}
+	w.turnMu.Unlock()
+}
+
+func TestStopKillsInflightWorkers(t *testing.T) {
+	m := newChanManager(chanManagerConfig{})
+	persistent := newWorkerAt("p", time.Now())
+	transient := newWorkerAt("i", time.Now())
+	m.workers["p"] = persistent
+	m.inflight[transient] = struct{}{}
+
+	m.Stop()
+
+	if !persistent.Dead() || !transient.Dead() {
+		t.Fatal("Stop must kill both persistent and inflight workers")
+	}
+	if len(m.workers) != 0 || len(m.inflight) != 0 {
+		t.Fatal("Stop must clear both registries")
+	}
+}
+
+func TestSnapshotIncludesInflight(t *testing.T) {
+	m := newChanManager(chanManagerConfig{})
+	m.workers["p"] = newWorkerAt("p", time.Now())
+	m.inflight[newWorkerAt("i", time.Now())] = struct{}{}
+
+	snap := m.snapshot()
+	if len(snap) != 2 {
+		t.Fatalf("snapshot should report workers + inflight, got %d", len(snap))
+	}
+	var transientSeen bool
+	for _, row := range snap {
+		if row["transient"] == true {
+			transientSeen = true
+		}
+	}
+	if !transientSeen {
+		t.Fatal("inflight worker must be marked transient in snapshot")
 	}
 }
 
@@ -287,14 +416,30 @@ func TestIsChannelEligible(t *testing.T) {
 		want bool
 	}{
 		{"stream+session+notools", mk(true, "s1", 0), true},
-		{"no session degrades", mk(true, "", 0), false},
+		{"stream+nosession (ephemeral)", mk(true, "", 0), true}, // no session → ephemeral channel, not legacy -p
 		{"non-stream degrades", mk(false, "s1", 0), false},
+		{"non-stream nosession degrades", mk(false, "", 0), false},
 		{"tools degrade", mk(true, "s1", 2), false},
 	}
 	for _, c := range cases {
 		if got := isChannelEligible(c.req); got != c.want {
 			t.Errorf("%s: isChannelEligible = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+func TestNewUUID(t *testing.T) {
+	re := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	seen := map[string]bool{}
+	for i := 0; i < 1000; i++ {
+		u := newUUID()
+		if !re.MatchString(u) {
+			t.Fatalf("newUUID() = %q is not a valid RFC-4122 v4 UUID", u)
+		}
+		if seen[u] {
+			t.Fatalf("newUUID() produced a duplicate: %q", u)
+		}
+		seen[u] = true
 	}
 }
 

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,16 @@ import (
 
 	"clawrelay-api/pkg/proc"
 )
+
+// newUUID returns a random RFC-4122 v4 UUID string. claude's --session-id
+// requires a valid UUID, so ephemeral (no-session) channel runs mint one here.
+func newUUID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
 
 // Channel mode keeps one persistent `claude --print --input-format stream-json`
 // process per session_id. Each inbound /v1/chat/completions request feeds its
@@ -61,11 +72,31 @@ type chanWorker struct {
 
 	writeMu sync.Mutex // serializes stdin writes (user messages, interrupts)
 
-	turnMu sync.Mutex // held by the handler for the whole duration of a turn
+	turnMu sync.Mutex  // held by the handler for the whole duration of a turn
+	inTurn atomic.Bool // true while a turn is actively streaming (reap/evict must skip it)
 
-	curMu    sync.Mutex
-	curLines chan string // current turn's line sink; only drainStdout closes it
+	curMu sync.Mutex
+	cur   *activeTurn // current turn's channels; nil between turns
 }
+
+// activeTurn bundles one turn's stdout-line channel with an abandon signal.
+//
+// Invariant that prevents "send on closed channel" panics: `lines` is closed
+// ONLY by the drainStdout goroutine (via closeLines). Every other goroutine
+// that wants to end a turn early (the cmd.Wait waiter, kill, beginTurn's error
+// path) closes `quit` instead (via abandon); that wakes drainStdout's send
+// select, which then performs the single close of `lines` itself. Since the one
+// goroutine that sends on `lines` is also the only one that closes it, a send
+// can never race a close.
+type activeTurn struct {
+	lines     chan string   // stdout sink; closed only by drainStdout
+	quit      chan struct{} // closed to abandon the turn (any goroutine)
+	quitOnce  sync.Once
+	linesOnce sync.Once
+}
+
+func (a *activeTurn) abandon()    { a.quitOnce.Do(func() { close(a.quit) }) }
+func (a *activeTurn) closeLines() { a.linesOnce.Do(func() { close(a.lines) }) }
 
 func (w *chanWorker) SessionID() string   { v, _ := w.sessionID.Load().(string); return v }
 func (w *chanWorker) Dead() bool          { return w.dead.Load() }
@@ -123,8 +154,9 @@ func spawnChanWorker(key string, args []string, workdir string, envVars map[stri
 		w.dead.Store(true)
 		_ = stdin.Close()
 		close(w.deadCh)
-		// Unblock any handler still ranging over the current turn channel.
-		w.closeCurrentTurn(nil)
+		// Unblock any handler still ranging over the current turn channel: wake
+		// a possibly-parked drainStdout send so it closes `lines` itself.
+		w.abandonActiveTurn(nil)
 		if onDie != nil {
 			onDie()
 		}
@@ -134,24 +166,42 @@ func spawnChanWorker(key string, args []string, workdir string, envVars map[stri
 	return w, nil
 }
 
-// closeCurrentTurn closes the active turn's line channel and clears it. When
-// only is non-nil, it only closes if that exact channel is still current
-// (prevents closing a freshly started turn). Safe to call repeatedly.
-func (w *chanWorker) closeCurrentTurn(only chan string) {
+// abandonActiveTurn signals the active turn to end early (called by the waiter,
+// kill, or beginTurn's error path — any goroutine). It only closes `quit`;
+// drainStdout reacts by closing `lines`. only!=nil restricts to that exact turn.
+func (w *chanWorker) abandonActiveTurn(only *activeTurn) {
 	w.curMu.Lock()
-	defer w.curMu.Unlock()
-	if w.curLines == nil {
+	a := w.cur
+	w.curMu.Unlock()
+	if a == nil || (only != nil && a != only) {
 		return
 	}
-	if only != nil && w.curLines != only {
-		return
+	a.abandon()
+}
+
+// completeActiveTurn closes the turn's `lines` (the SOLE close site, always on
+// the drainStdout goroutine) and clears it if still current. Idempotent.
+func (w *chanWorker) completeActiveTurn(a *activeTurn) {
+	w.curMu.Lock()
+	if w.cur == a {
+		w.cur = nil
 	}
-	close(w.curLines)
-	w.curLines = nil
+	w.curMu.Unlock()
+	a.closeLines()
 }
 
 func (w *chanWorker) drainStdout(r io.Reader) {
-	defer w.closeCurrentTurn(nil) // process stdout ended → unblock the handler
+	// On EOF, close whatever turn is still active (single close site).
+	defer func() {
+		w.curMu.Lock()
+		a := w.cur
+		w.cur = nil
+		w.curMu.Unlock()
+		if a != nil {
+			a.closeLines()
+		}
+	}()
+
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	for sc.Scan() {
@@ -172,15 +222,21 @@ func (w *chanWorker) drainStdout(r io.Reader) {
 		// Forward to the active turn, if any. Lines that arrive between turns
 		// (e.g. the init/system event at spawn) have no sink and are dropped.
 		w.curMu.Lock()
-		cur := w.curLines
+		a := w.cur
 		w.curMu.Unlock()
-		if cur == nil {
+		if a == nil {
 			continue
 		}
-		cur <- line
-		if probe.Type == "result" {
-			// Turn boundary: this user message has been fully answered.
-			w.closeCurrentTurn(cur)
+		// Send-select: a parked send is rescued by quit (abandon), so a close
+		// can never race the send. drainStdout is the only closer of a.lines.
+		select {
+		case a.lines <- line:
+			if probe.Type == "result" {
+				// Turn boundary: this user message has been fully answered.
+				w.completeActiveTurn(a)
+			}
+		case <-a.quit:
+			w.completeActiveTurn(a)
 		}
 	}
 }
@@ -240,10 +296,11 @@ func (w *chanWorker) beginTurn(content string) (<-chan string, error) {
 		w.turnMu.Unlock()
 		return nil, errWorkerDead
 	}
-	lines := make(chan string, 256)
+	a := &activeTurn{lines: make(chan string, 256), quit: make(chan struct{})}
 	w.curMu.Lock()
-	w.curLines = lines
+	w.cur = a
 	w.curMu.Unlock()
+	w.inTurn.Store(true)
 
 	envelope := map[string]any{
 		"type": "user",
@@ -260,17 +317,31 @@ func (w *chanWorker) beginTurn(content string) (<-chan string, error) {
 	w.writeMu.Unlock()
 	if err != nil {
 		w.dead.Store(true)
-		w.closeCurrentTurn(lines)
+		w.inTurn.Store(false)
+		w.abandonActiveTurn(a) // wake drainStdout to close lines
 		w.turnMu.Unlock()
 		return nil, fmt.Errorf("write user message: %w", err)
 	}
+	// The write can succeed on a child that exited a moment ago (the stdin pipe
+	// buffer still accepts it). If the process is already dead, drainStdout may
+	// have exited without ever seeing this turn, so nothing would close a.lines.
+	// Fail fast and let the caller re-acquire rather than hand out a dead turn.
+	select {
+	case <-w.deadCh:
+		w.inTurn.Store(false)
+		w.abandonActiveTurn(a)
+		w.turnMu.Unlock()
+		return nil, errWorkerDead
+	default:
+	}
 	w.markUsed()
-	return lines, nil
+	return a.lines, nil
 }
 
 // endTurn releases the worker for the next request. It must be called after the
 // turn's line channel has closed (the handler always drains to completion).
 func (w *chanWorker) endTurn() {
+	w.inTurn.Store(false)
 	w.markUsed()
 	w.turnMu.Unlock()
 }
@@ -291,9 +362,12 @@ func (w *chanWorker) interrupt() error {
 }
 
 // kill force-terminates the process group (used as the interrupt-timeout
-// backstop). The session is persisted on disk, so a later request --resumes it.
+// backstop and for ephemeral teardown). The session is persisted on disk, so a
+// later request --resumes it. It abandons the active turn first so a parked
+// drainStdout send unblocks immediately rather than waiting for the pipe EOF.
 func (w *chanWorker) kill() {
 	w.dead.Store(true)
+	w.abandonActiveTurn(nil)
 	proc.KillGroup(w.cmd)
 }
 
@@ -305,16 +379,53 @@ type chanManagerConfig struct {
 	MaxChannels int
 }
 
-// chanManager owns all channel workers, keyed by session_id.
+// chanManager owns all channel workers, keyed by session_id, plus an `inflight`
+// set of workers that have been spawned but are not (yet) in `workers`: a
+// persistent worker during its waitStartup window, and an ephemeral worker for
+// the duration of its single run. Tracking them means SIGTERM Stop() reaps them
+// and /channels can see them, so no claude child is orphaned on shutdown.
 type chanManager struct {
 	cfg chanManagerConfig
 
-	mu      sync.Mutex
-	workers map[string]*chanWorker
+	mu       sync.Mutex
+	workers  map[string]*chanWorker
+	inflight map[*chanWorker]struct{}
 }
 
 func newChanManager(cfg chanManagerConfig) *chanManager {
-	return &chanManager{cfg: cfg, workers: make(map[string]*chanWorker)}
+	return &chanManager{
+		cfg:      cfg,
+		workers:  make(map[string]*chanWorker),
+		inflight: make(map[*chanWorker]struct{}),
+	}
+}
+
+// trackInflight / untrackInflight register a spawned-but-not-promoted worker so
+// shutdown reaps it and snapshot() reports it.
+func (m *chanManager) trackInflight(w *chanWorker) {
+	m.mu.Lock()
+	m.inflight[w] = struct{}{}
+	m.mu.Unlock()
+}
+
+func (m *chanManager) untrackInflight(w *chanWorker) {
+	m.mu.Lock()
+	delete(m.inflight, w)
+	m.mu.Unlock()
+}
+
+// drop kills and removes the persistent worker for sessionID, if any. Used
+// before a same-session request that must fall through to the legacy
+// `claude --resume` path, so the two never write the session jsonl at once.
+func (m *chanManager) drop(sessionID string) {
+	m.mu.Lock()
+	w := m.workers[sessionID]
+	delete(m.workers, sessionID)
+	m.mu.Unlock()
+	if w != nil {
+		log.Printf("[channel] dropping worker session=%s (legacy fall-through for same session)", sessionID)
+		w.kill()
+	}
 }
 
 // StartReaper kills workers idle longer than IdleTTL until ctx is cancelled.
@@ -342,9 +453,17 @@ func (m *chanManager) reapOnce() {
 			delete(m.workers, k)
 			continue
 		}
-		if w.LastUsed().Before(cutoff) {
+		// Never reap a worker mid-turn: a turn that streams longer than IdleTTL
+		// has a stale lastUsed, but killing it would drop the live response.
+		if !w.inTurn.Load() && w.LastUsed().Before(cutoff) {
 			toKill = append(toKill, w)
 			delete(m.workers, k)
+		}
+	}
+	// Drop any dead worker that lingered in inflight (e.g. died during startup).
+	for w := range m.inflight {
+		if w.Dead() {
+			delete(m.inflight, w)
 		}
 	}
 	m.mu.Unlock()
@@ -400,8 +519,15 @@ func (m *chanManager) acquire(sessionID string, p spawnParams) (*chanWorker, err
 		return nil, err
 	}
 
+	// Promote from inflight to workers atomically. Register only if still alive:
+	// the spawn ran outside m.mu, so its onDie could have fired-and-found-nothing
+	// before this insert. A dead worker here is returned unregistered; beginTurn
+	// will fail and the caller re-acquires.
 	m.mu.Lock()
-	m.workers[sessionID] = w
+	delete(m.inflight, w)
+	if !w.Dead() {
+		m.workers[sessionID] = w
+	}
 	m.mu.Unlock()
 	return w, nil
 }
@@ -421,19 +547,25 @@ func (m *chanManager) spawnWithRetry(sessionID string, p spawnParams) (*chanWork
 		}
 		w.boundSystemPrompt = p.systemPrompt
 		w.boundModel = p.model
+		// Track during the startup window so a SIGTERM Stop() can kill it
+		// (it may be mid-MCP-init for several seconds). acquire promotes it.
+		m.trackInflight(w)
 
 		switch w.waitStartup(8 * time.Second) {
 		case startupReady:
 			return w, nil
 		case startupRetryResume:
 			log.Printf("[channel] session=%s: --session-id rejected (already in use), retrying with --resume", sessionID)
+			m.untrackInflight(w)
 			w.kill()
 			flag = "--resume"
 		case startupRetryNew:
 			log.Printf("[channel] session=%s: --resume rejected (no conversation), retrying with --session-id", sessionID)
+			m.untrackInflight(w)
 			w.kill()
 			flag = "--session-id"
 		case startupFatal:
+			m.untrackInflight(w)
 			w.kill()
 			return nil, fmt.Errorf("channel worker for session %s died at startup", sessionID)
 		}
@@ -445,13 +577,16 @@ func (m *chanManager) evictOldestLocked() {
 	var oldestKey string
 	var oldest time.Time
 	for k, w := range m.workers {
+		if w.inTurn.Load() {
+			continue // don't evict a worker that is mid-turn
+		}
 		if oldestKey == "" || w.LastUsed().Before(oldest) {
 			oldestKey = k
 			oldest = w.LastUsed()
 		}
 	}
 	if oldestKey == "" {
-		return
+		return // all workers busy; allow the new spawn to exceed the soft cap
 	}
 	w := m.workers[oldestKey]
 	delete(m.workers, oldestKey)
@@ -468,21 +603,26 @@ func (m *chanManager) onWorkerDie(sessionID string) {
 	m.mu.Unlock()
 }
 
-// Stop kills every worker (called on shutdown).
+// Stop kills every worker — persistent AND inflight (in-spawn + ephemeral) — on
+// shutdown, so no orphaned claude child is left behind.
 func (m *chanManager) Stop() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, w := range m.workers {
 		w.kill()
 	}
+	for w := range m.inflight {
+		w.kill()
+	}
 	m.workers = make(map[string]*chanWorker)
+	m.inflight = make(map[*chanWorker]struct{})
 }
 
-// snapshot returns a debug view of tracked workers.
+// snapshot returns a debug view of all live workers (persistent + inflight).
 func (m *chanManager) snapshot() []map[string]any {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]map[string]any, 0, len(m.workers))
+	out := make([]map[string]any, 0, len(m.workers)+len(m.inflight))
 	for k, w := range m.workers {
 		out = append(out, map[string]any{
 			"session_id": k,
@@ -490,6 +630,17 @@ func (m *chanManager) snapshot() []map[string]any {
 			"flag":       w.usedFlag,
 			"last_used":  w.LastUsed().Format(time.RFC3339),
 			"dead":       w.Dead(),
+			"transient":  false,
+		})
+	}
+	for w := range m.inflight {
+		out = append(out, map[string]any{
+			"session_id": w.key,
+			"claude_sid": w.SessionID(),
+			"flag":       w.usedFlag,
+			"last_used":  w.LastUsed().Format(time.RFC3339),
+			"dead":       w.Dead(),
+			"transient":  true,
 		})
 	}
 	return out

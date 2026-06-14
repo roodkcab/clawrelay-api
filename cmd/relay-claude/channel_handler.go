@@ -128,6 +128,136 @@ func lastUserTurnContent(messages []openai.ChatMessage, sessionDir string) (cont
 	return text, tempFiles, true
 }
 
+// handleChannelEphemeralStreamResponse serves a request that has NO session_id
+// while in channel mode. Rather than degrade to the legacy `claude -p` path, it
+// runs the request through the same stream-json channel mechanism on a fresh,
+// throwaway process: mint a brand-new session_id, spawn one `--input-format
+// stream-json` process, feed the full conversation, stream the turn, then kill
+// the process. No reuse, no pooling — each independent (e.g. cron) request gets
+// its own isolated run, so contexts never cross-contaminate.
+//
+// The conversation is flattened exactly as the legacy path would build it (no
+// prior process context exists), so what claude receives is identical to
+// legacy; only the delivery channel differs (stdin stream-json vs `-p`).
+func handleChannelEphemeralStreamResponse(w http.ResponseWriter, r *http.Request, req *openai.ChatCompletionRequest, model string, includeUsage bool) {
+	// No session → temp attachments, full-conversation flatten (== legacy, so
+	// what claude receives is identical; only the delivery channel differs). No
+	// empty-prompt rejection here: the legacy path accepts it, so we match it.
+	prompt, systemPrompt, tempFiles := buildPromptFromMessages(req.Messages, "")
+	if len(tempFiles) > 0 {
+		defer func() {
+			for _, f := range tempFiles {
+				os.Remove(f)
+			}
+		}()
+	}
+
+	chatID := openai.GenerateChatID()
+	created := time.Now().Unix()
+	sid := newUUID()
+
+	args := append(buildChannelArgs(req, model, systemPrompt), "--session-id", sid)
+	worker, err := spawnChanWorker(sid, args, req.WorkingDir, req.EnvVars, "--session-id", func() {})
+	if err != nil {
+		log.Printf("[channel] ephemeral spawn failed: %v", err)
+		openai.WriteError(w, http.StatusInternalServerError, "server_error", err.Error())
+		return
+	}
+	// Track so SIGTERM shutdown reaps it and /channels can see it.
+	channelMgr.trackInflight(worker)
+
+	lines, err := worker.beginTurn(prompt)
+	if err != nil {
+		channelMgr.untrackInflight(worker)
+		worker.kill()
+		openai.WriteError(w, http.StatusInternalServerError, "server_error", err.Error())
+		return
+	}
+
+	// The throwaway process is always killed when this turn ends (completion,
+	// stop, or AskUserQuestion). kill() abandons the active turn (unblocking the
+	// stdout reader), and the background drain lets all worker goroutines exit.
+	finished := false
+	finish := func() {
+		if finished {
+			return
+		}
+		finished = true
+		channelMgr.untrackInflight(worker)
+		worker.kill()
+		go func() {
+			for {
+				select {
+				case _, ok := <-lines:
+					if !ok {
+						return
+					}
+				case <-worker.deadCh:
+					return // process reaped; lines may never close
+				}
+			}
+		}()
+	}
+	defer finish()
+
+	log.Printf("[channel] ephemeral turn start session=%s model=%s chat=%s", sid, model, chatID)
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, isFlusher := w.(http.Flusher)
+	if !isFlusher {
+		log.Printf("[channel] ephemeral: streaming not supported; killing")
+		return
+	}
+
+	fmt.Fprintf(w, ": ping\n\n")
+	flusher.Flush()
+
+	heartbeat := time.NewTicker(30 * time.Second)
+	defer heartbeat.Stop()
+
+	t := newSSETranslator(chatID, created, model, "") // no session → log no-ops
+	for {
+		select {
+		case <-r.Context().Done():
+			// Upstream disconnected = stop. Ephemeral run: just kill it.
+			log.Printf("[channel] ephemeral stop session=%s (kill)", sid)
+			return
+		case <-worker.deadCh:
+			// Process died mid-turn; `lines` may never close. Finalize and exit
+			// rather than block forever (finish kills + drains).
+			t.flushAggLog()
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			log.Printf("[channel] ephemeral turn end session=%s (process died)", sid)
+			return
+		case <-heartbeat.C:
+			fmt.Fprintf(w, ": keepalive\n\n")
+			flusher.Flush()
+		case line, lok := <-lines:
+			if !lok {
+				t.flushAggLog()
+				fmt.Fprintf(w, "data: [DONE]\n\n")
+				flusher.Flush()
+				log.Printf("[channel] ephemeral turn end session=%s (completed)", sid)
+				return
+			}
+			if line == "" {
+				continue
+			}
+			if t.feed(w, flusher, line, includeUsage) == outcomeAskUserDone {
+				// No session to continue on; the card was emitted, kill the run.
+				log.Printf("[channel] ephemeral turn end session=%s (ask_user)", sid)
+				return
+			}
+		}
+	}
+}
+
 // handleChannelStreamResponse serves one /v1/chat/completions turn through the
 // persistent channel worker for req.SessionID. The SSE byte stream is produced
 // by the shared sseTranslator, identical to the legacy path. The process is
@@ -209,10 +339,22 @@ func handleChannelStreamResponse(w http.ResponseWriter, r *http.Request, req *op
 			worker.kill()
 		})
 		go func() {
-			for range lines { //nolint:revive // drain until result/EOF closes it
+			for {
+				select {
+				case _, ok := <-lines:
+					if !ok {
+						timer.Stop()
+						worker.endTurn()
+						return
+					}
+				case <-worker.deadCh:
+					// Process died; lines may never close. Stop waiting so the
+					// worker is released rather than leaking this goroutine.
+					timer.Stop()
+					worker.endTurn()
+					return
+				}
 			}
-			timer.Stop()
-			worker.endTurn()
 		}()
 	}
 	defer func() {
@@ -249,6 +391,15 @@ func handleChannelStreamResponse(w http.ResponseWriter, r *http.Request, req *op
 			// Upstream disconnected = stop. Interrupt (not kill) and release in
 			// the background; the process and its context survive.
 			releaseInBackground("client_disconnect")
+			return
+		case <-worker.deadCh:
+			// Process died mid-turn; `lines` may never close. Finalize and let
+			// the deferred endTurn release the worker.
+			t.flushAggLog()
+			sessionStore.LogDone(sessionID, t.StreamUsage())
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			log.Printf("[channel] turn end session=%s (process died)", sessionID)
 			return
 		case <-heartbeat.C:
 			fmt.Fprintf(w, ": keepalive\n\n")

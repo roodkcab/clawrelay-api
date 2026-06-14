@@ -67,10 +67,11 @@ var (
 )
 
 // isChannelEligible reports whether a request matches the shape the channel
-// path serves: streaming, session-bound, and tool-less. Everything else
-// degrades to the legacy per-request path (§4.2: empty session_id → legacy).
+// mechanism serves: streaming and tool-less. A present session_id reuses a
+// persistent process; an absent one runs ephemerally (fresh process per
+// request). Non-stream or tool-bearing requests fall through to legacy.
 func isChannelEligible(req *openai.ChatCompletionRequest) bool {
-	return req.Stream && req.SessionID != "" && len(req.Tools) == 0
+	return req.Stream && len(req.Tools) == 0
 }
 
 func resolveModel(model string) string {
@@ -124,16 +125,31 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
 	hasTools := len(req.Tools) > 0
 
-	// Channel mode: serve the streaming, session-bound, tool-less request shape
-	// (exactly what wuji_tools sends) through a persistent stream-json process
-	// keyed by session_id. Every other shape — no session_id, non-stream, or
-	// tools present — degrades to the legacy per-request path below for an
-	// identical contract.
+	// Channel mode: serve every streaming, tool-less request through the
+	// stream-json mechanism (never the legacy `claude -p` path). Requests with a
+	// session_id reuse a persistent process keyed by session_id; requests
+	// without one (e.g. stateless cron tasks) get a fresh, throwaway process
+	// that runs once and is killed. Non-stream or tool-bearing shapes still fall
+	// through to the legacy path (the channel mechanism only models streaming,
+	// tool-less turns; wuji_tools never sends those shapes anyway).
 	if relayMode == "channel" && isChannelEligible(&req) {
-		log.Printf("ChatCompletion request [channel]: model=%s session=%s messages=%d", model, req.SessionID, len(req.Messages))
-		sessionStore.LogRequest(req.SessionID, &req)
-		handleChannelStreamResponse(w, r, &req, model, includeUsage)
+		if req.SessionID != "" {
+			log.Printf("ChatCompletion request [channel]: model=%s session=%s messages=%d", model, req.SessionID, len(req.Messages))
+			sessionStore.LogRequest(req.SessionID, &req)
+			handleChannelStreamResponse(w, r, &req, model, includeUsage)
+		} else {
+			log.Printf("ChatCompletion request [channel/ephemeral]: model=%s (no session) messages=%d", model, len(req.Messages))
+			handleChannelEphemeralStreamResponse(w, r, &req, model, includeUsage)
+		}
 		return
+	}
+
+	// Falling through to legacy in channel mode with a session_id (a non-stream
+	// or tool-bearing request): a live channel worker may be holding that
+	// session's jsonl open. Drop it first so the legacy `claude --resume` below
+	// can't write the same session concurrently.
+	if relayMode == "channel" && channelMgr != nil && req.SessionID != "" {
+		channelMgr.drop(req.SessionID)
 	}
 
 	var sessionDir string
