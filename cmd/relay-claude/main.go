@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -13,15 +14,17 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"clawrelay-api/pkg/openai"
 	"clawrelay-api/pkg/sessions"
 )
 
-var version = "1.1.4"
+var version = "1.2.0"
 
 var defaultModel = "vllm/claude-sonnet-4-6"
 
@@ -51,11 +54,24 @@ var allowedOrigins = []string{
 	"https://goofish-stat.52ritao.cn",
 }
 
-// Process-wide singletons. Both are created in main() and read from handlers.
+// Process-wide singletons. Created in main() and read from handlers.
 var (
 	sessionStore *sessions.Store
 	stats        = openai.NewStats()
+
+	// relayMode is "legacy" (default; per-request `claude -p`) or "channel"
+	// (one persistent `claude --input-format stream-json` process per
+	// session_id). channelMgr is non-nil only in channel mode.
+	relayMode  = "legacy"
+	channelMgr *chanManager
 )
+
+// isChannelEligible reports whether a request matches the shape the channel
+// path serves: streaming, session-bound, and tool-less. Everything else
+// degrades to the legacy per-request path (§4.2: empty session_id → legacy).
+func isChannelEligible(req *openai.ChatCompletionRequest) bool {
+	return req.Stream && req.SessionID != "" && len(req.Tools) == 0
+}
 
 func resolveModel(model string) string {
 	if idx := strings.LastIndex(model, "/"); idx >= 0 {
@@ -105,6 +121,21 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		model = defaultModel
 	}
 
+	includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+	hasTools := len(req.Tools) > 0
+
+	// Channel mode: serve the streaming, session-bound, tool-less request shape
+	// (exactly what wuji_tools sends) through a persistent stream-json process
+	// keyed by session_id. Every other shape — no session_id, non-stream, or
+	// tools present — degrades to the legacy per-request path below for an
+	// identical contract.
+	if relayMode == "channel" && isChannelEligible(&req) {
+		log.Printf("ChatCompletion request [channel]: model=%s session=%s messages=%d", model, req.SessionID, len(req.Messages))
+		sessionStore.LogRequest(req.SessionID, &req)
+		handleChannelStreamResponse(w, r, &req, model, includeUsage)
+		return
+	}
+
 	var sessionDir string
 	if req.SessionID != "" {
 		sessionDir = filepath.Join(sessionStore.AbsDir(), req.SessionID, "files")
@@ -118,7 +149,6 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	hasTools := len(req.Tools) > 0
 	if hasTools {
 		systemPrompt += buildToolPrompt(req.Tools)
 		log.Printf("Injected %d tool definitions into system prompt", len(req.Tools))
@@ -133,8 +163,6 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	args, stdinData := buildClaudeArgs(&req, model, prompt, systemPrompt)
 
 	log.Printf("Claude args: %v (stdin length: %d bytes)", args, len(stdinData))
-
-	includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
 
 	workingDir := req.WorkingDir
 	envVars := req.EnvVars
@@ -174,7 +202,23 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		"status":  "healthy",
 		"backend": "claude",
 		"version": version,
+		"mode":    relayMode,
 	})
+}
+
+// channelsHandler exposes the live channel-worker registry for debugging and
+// for verifying process reuse (each session_id should show a single worker
+// across multiple turns). Empty in legacy mode.
+func channelsHandler(w http.ResponseWriter, r *http.Request) {
+	openai.SetCORSHeaders(w, r, allowedOrigins)
+	w.Header().Set("Content-Type", "application/json")
+	resp := map[string]any{"mode": relayMode}
+	if channelMgr != nil {
+		resp["workers"] = channelMgr.snapshot()
+	} else {
+		resp["workers"] = []any{}
+	}
+	json.NewEncoder(w).Encode(resp)
 }
 
 func statsHandler(w http.ResponseWriter, r *http.Request) {
@@ -193,6 +237,9 @@ func main() {
 	model := flag.String("model", "", "default model name (e.g. claude-sonnet-4-6)")
 	sessionsDir := flag.String("sessions-dir", "sessions", "directory for session log files + attachments")
 	logFilePath := flag.String("log-file", "relay-claude.log", "log file path (use - for stdout only)")
+	mode := flag.String("mode", "legacy", "legacy=per-request `claude -p`; channel=persistent stream-json process per session_id")
+	idleTTL := flag.Duration("idle-ttl", 30*time.Minute, "channel mode: kill a session's process after this much idle time")
+	maxChannels := flag.Int("max-channels", 50, "channel mode: max concurrent persistent processes (oldest evicted past this)")
 	showVersion := flag.Bool("version", false, "show version and exit")
 	flag.Parse()
 
@@ -226,11 +273,39 @@ func main() {
 	sessionStore = sessions.New(*sessionsDir)
 	sessionStore.StartCleanup(72*time.Hour, 1*time.Hour)
 
+	relayMode = *mode
+	if relayMode == "channel" {
+		channelMgr = newChanManager(chanManagerConfig{
+			IdleTTL:     *idleTTL,
+			MaxChannels: *maxChannels,
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		channelMgr.StartReaper(ctx)
+		log.Printf("Channel mode ENABLED: idle-ttl=%s max-channels=%d", *idleTTL, *maxChannels)
+
+		// Graceful shutdown: kill every persistent worker process group so no
+		// orphaned `claude` child is left blocked on stdin after the relay
+		// exits (legacy per-request children self-terminate, channel ones do
+		// not). SIGTERM is what the restart SOP's `kill` sends.
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			s := <-sigCh
+			log.Printf("Received %s: killing %d channel worker(s) before exit", s, len(channelMgr.snapshot()))
+			channelMgr.Stop()
+			os.Exit(0)
+		}()
+	} else {
+		log.Printf("Legacy mode (per-request claude -p)")
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", chatCompletionsHandler)
 	mux.HandleFunc("/v1/models", modelsHandler)
 	mux.HandleFunc("/v1/stats", statsHandler)
 	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/channels", channelsHandler)
 	mux.HandleFunc("/sessions", sessionStore.ListHandler())
 	mux.HandleFunc("/session/", sessionStore.PageHandler())
 
