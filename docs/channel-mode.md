@@ -29,13 +29,22 @@ claude_openai_api --port=50008 --mode=channel --idle-ttl=20m --max-channels=40
 
 ## 3. 分流规则（哪些请求走 channel）
 
-只有 **`stream=true` + 有 `session_id` + 无 `tools`** 的请求走 channel（正是 wuji_tools 的请求形态）。其余一律降级 legacy，保证完全兼容：
+channel 模式下，**所有 `stream=true` 且无 `tools` 的请求都走 stream-json 机制，不再降级 `claude -p`**：
 
-- `session_id` 为空 → legacy（§4.2 退化）
-- 非流式 → legacy（`handleNonStreamResponse`）
-- 带 `tools` → legacy（`handleBufferedStreamResponse`）
+| 请求形态 | 路径 |
+|----------|------|
+| `stream` + 有 `session_id` + 无 `tools` | **持久化 channel**：按 session_id 复用常驻进程（多轮省 spawn） |
+| `stream` + 无 `session_id` + 无 `tools`（如无状态 cron） | **ephemeral channel**：全新 UUID 起独立进程，喂完整对话，跑完即 kill（见 §3.1） |
+| 非流式 / 带 `tools` | legacy（`handleNonStreamResponse` / `handleBufferedStreamResponse`，这些形态 wuji_tools 不会发） |
 
-判定见 `isChannelEligible()`（`cmd/relay-claude/main.go`）。
+判定见 `isChannelEligible()`（`stream && 无 tools`）+ dispatch 按 `session_id` 有无分流（`cmd/relay-claude/main.go`）。
+
+### 3.1 Ephemeral（无 session_id）独立运行
+
+无 session_id 的请求每次都是一次**独立运行**：mint 一个全新 UUID → spawn 一个 `--input-format stream-json` 进程 → 用 `buildPromptFromMessages` 把整段对话扁平化后喂入（与 legacy 收到的内容**完全一致**）→ 流式翻译返回 → 本轮 `result` 后 **kill 进程**。不复用、不入池，独立请求间上下文不串台。
+
+> claude 在同一 cwd 下有跨 session 的 memory 行为；ephemeral 与 legacy 在这点上表现一致（非回归）。
+> ephemeral 进程在运行期间登记在 manager 的 `inflight` 集合里（供 SIGTERM 优雅关闭与 `/channels` 可见），跑完即注销并 kill。
 
 ## 4. 架构
 
@@ -95,5 +104,14 @@ claude_openai_api --port=50008 --mode=channel --idle-ttl=20m --max-channels=40
   | channel | 22.3s | **1.76s（复用，省 ~20.5s）** |
 
 - legacy 真实 opus 流量零回归（token 统计完整）；本地 race + 单测 + 端到端集成全绿。
+- 三轮对抗式审查共修 11 个并发/正确性问题（含 1 个会导致 relay 整体崩溃的 send-on-closed 竞争），最终审查 CLEAN。详见 §9。
+- 上线后真实 opus 多轮会话已观测到 channel 复用（同 session 跨多轮复用同一进程），无 panic、内存稳定。
 
-> **注意**：claude01 的实际流量大多是无状态 cron 巡检任务（无 `session_id`），会正确降级 legacy，故 channel 在该实例收益有限。channel 的大收益只对**多轮对话型 bot** 显著。
+> **流量构成**：claude01 既有无状态 cron 巡检任务（无 `session_id` → ephemeral channel），也有多轮对话会话（有 `session_id` → 持久化复用，收益最大）。两类现在都走 channel，不再用 `-p`。
+
+## 9. 并发设计要点（加固后）
+
+- **per-turn 通道 `activeTurn{lines, quit}`**：`lines` **仅由 drainStdout goroutine 关闭**；其它 goroutine（cmd.Wait waiter / kill / beginTurn 错误路径）只关 `quit`（abandon），drainStdout 的发送用 `select{ case lines<-line; case <-quit }` 兜住——发送永不与关闭竞争，杜绝 "send on closed channel" panic。
+- **deadCh 逃生**：beginTurn 写后复检 `deadCh` 快速失败；两个前台循环 + 两个后台 drain 都监听 `worker.deadCh`，进程中途死亡时绝不永久阻塞在「永不关闭的 lines」上。
+- **inTurn 标志**：reaper / 容量 evict **跳过正在流式的 worker**（流式时长超 idle-ttl 也不会被误杀）。
+- **inflight 集合**：spawn 出来但尚未 promote 的 worker（持久化 waitStartup 期 + ephemeral 运行期）都登记，SIGTERM `Stop()` 一并 kill，杜绝重启孤儿。
