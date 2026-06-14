@@ -29,7 +29,11 @@ var channelInterruptBackstop = 90 * time.Second
 // each turn's user message is written to stdin as a stream-json envelope.
 func buildChannelArgs(req *openai.ChatCompletionRequest, model, systemPrompt string) []string {
 	var args []string
-	args = append(args, "--print")
+	// No --print: the relay captures stdout via a pipe (not a TTY), which alone
+	// puts claude into non-interactive mode (per `claude --help`: "via -p, or
+	// when stdout is not a TTY"). stream-json input/output therefore works
+	// without the explicit flag. Verified: multi-turn + interrupt behave
+	// identically to the --print variant.
 	args = append(args, "--input-format", "stream-json")
 	args = append(args, "--output-format", "stream-json")
 	args = append(args, "--include-partial-messages")

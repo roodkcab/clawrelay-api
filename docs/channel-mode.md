@@ -5,7 +5,9 @@
 
 ## 1. 它是什么
 
-`relay-claude` 的一种接入模式：**一个 `session_id` 对应一个常驻 `claude --print --input-format stream-json` 进程**，跨多轮对话从 stdin 持续喂消息，消除每轮的「spawn + session 重载 + MCP/skill 重新初始化」开销。
+`relay-claude` 的一种接入模式：**一个 `session_id` 对应一个常驻 `claude --input-format stream-json` 进程**，跨多轮对话从 stdin 持续喂消息，消除每轮的「spawn + session 重载 + MCP/skill 重新初始化」开销。
+
+> **不带 `--print`**：relay 用管道捕获子进程 stdout（非 TTY），claude 据此自动进入 non-interactive/headless 模式（`claude --help`：「via -p, **or when stdout is not a TTY**」），stream-json 输入/输出无需显式 `--print` 即生效。已实测多轮 + interrupt 行为与带 `--print` 完全一致。
 
 通过启动参数 `--mode=channel` 开启；`--mode=legacy`（默认）行为与改动前**字节级一致，零回归**。对上游 wuji_tools 的 OpenAI HTTP/SSE 协议**零改动**。
 
