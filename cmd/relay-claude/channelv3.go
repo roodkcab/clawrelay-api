@@ -35,10 +35,11 @@ import (
 
 // v3Config governs the V3 manager.
 type v3Config struct {
-	BridgeDir   string        // dir containing bridge.ts + node_modules (deployed)
-	IdleTTL     time.Duration // kill an interactive claude session after this idle
-	MaxSessions int           // cap on concurrent interactive claude processes
-	ReplyTotal  time.Duration // overall wait for a turn's reply
+	BridgeDir        string        // dir containing bridge.ts + node_modules (deployed)
+	IdleTTL          time.Duration // kill an interactive claude session after this idle
+	MaxSessions      int           // cap on concurrent interactive claude processes
+	ReplyTotal       time.Duration // overall wait for a turn's reply (idle-based, after first output)
+	ColdStartTimeout time.Duration // cold-start watchdog: a turn must produce its FIRST output within this, else relaunch+retry
 }
 
 // v3Msg is one inbound user turn handed to the bridge.
@@ -119,6 +120,18 @@ func newV3Manager(cfg v3Config) *v3Manager {
 		// genuine slow answer. 20min leaves that path ~10min of headroom to
 		// deliver a single silent >10min step.
 		cfg.ReplyTotal = 20 * time.Minute
+	}
+	if cfg.ColdStartTimeout <= 0 {
+		// Cold-start watchdog: a fresh interactive claude that produces NO output
+		// at all within this window is presumed frozen on a startup step (e.g.
+		// stuck "Checking for updates") — kill + relaunch + retry once. Override
+		// with V3_COLD_START_TIMEOUT (e.g. "10s" to exercise the retry path).
+		cfg.ColdStartTimeout = 5 * time.Minute
+		if v := os.Getenv("V3_COLD_START_TIMEOUT"); v != "" {
+			if d, err := time.ParseDuration(v); err == nil && d > 0 {
+				cfg.ColdStartTimeout = d
+			}
+		}
 	}
 	return &v3Manager{
 		cfg:      cfg,
@@ -240,6 +253,28 @@ func (m *v3Manager) inboxFor(sid string) chan v3Msg {
 func (m *v3Manager) enqueue(sid string, msg v3Msg) {
 	m.inboxFor(sid) <- msg
 }
+
+// drainInbox empties any undelivered inbound turns for a session — used before a
+// cold-start retry so the relaunched bridge doesn't inject a stale duplicate.
+func (m *v3Manager) drainInbox(sid string) {
+	q := m.inboxFor(sid)
+	for {
+		select {
+		case <-q:
+		default:
+			return
+		}
+	}
+}
+
+// v3TurnOutcome is what one runAttempt() of handleChannelV3Response resolves to.
+type v3TurnOutcome int
+
+const (
+	v3OutcomeDone       v3TurnOutcome = iota // reply delivered / terminal handled — caller returns
+	v3OutcomeColdHang                        // no output within ColdStartTimeout — caller may relaunch+retry
+	v3OutcomeClientGone                      // client disconnected — caller returns (session kept alive)
+)
 
 func (m *v3Manager) registerWaiter(reqID string) *v3Waiter {
 	wt := &v3Waiter{ch: make(chan v3ReplyEvent, 256), done: make(chan struct{})}
@@ -658,120 +693,156 @@ func handleChannelV3Response(w http.ResponseWriter, r *http.Request, req *openai
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
 
-	// Phase 1: wait until the session's channel is live (first launch only).
-	readyDeadline := time.After(2 * time.Minute)
-waitReady:
-	for {
-		select {
-		case <-sess.ready:
-			break waitReady
-		case <-heartbeat.C:
-			v3EmitThinkingDelta(w, flusher, chatID, created, model,
-				fmt.Sprintf("\n⏳ 正在准备会话…（已 %ds）", int(time.Since(reqStart).Seconds())))
-		case <-sess.deadCh:
-			fmt.Fprintf(w, "data: %s\n\n", v3ErrChunk(chatID, created, model, "claude session ended during startup"))
-			fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
-			return
-		case <-r.Context().Done():
-			return
-		case <-readyDeadline:
-			fmt.Fprintf(w, "data: %s\n\n", v3ErrChunk(chatID, created, model, "channel startup timeout"))
-			fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
-			log.Printf("[v3] channel startup timeout session=%s", sid)
-			return
+	// runAttempt drives ONE attempt at this turn on the given (already acquired)
+	// session: Phase 1 waits for the channel to go live, Phase 2 sends the turn
+	// and streams the reply. The cold-start watchdog requires the FIRST output to
+	// arrive within ColdStartTimeout; once any output arrives the turn is
+	// "committed" and the idle timeout (ReplyTotal) governs the rest (so genuinely
+	// long work is never cut). If no output arrives in time (a frozen cold start),
+	// it returns v3OutcomeColdHang so the caller can kill + relaunch + retry.
+	runAttempt := func(sess *v3Session) v3TurnOutcome {
+		// Single per-attempt deadline for the FIRST output (covers a never-ready
+		// channel AND a ready-but-frozen claude).
+		coldDeadline := time.After(v3Mgr.cfg.ColdStartTimeout)
+
+		// Phase 1: wait until the session's channel is live.
+	waitReady:
+		for {
+			select {
+			case <-sess.ready:
+				break waitReady
+			case <-heartbeat.C:
+				v3EmitThinkingDelta(w, flusher, chatID, created, model,
+					fmt.Sprintf("\n⏳ 正在准备会话…（已 %ds）", int(time.Since(reqStart).Seconds())))
+			case <-sess.deadCh:
+				log.Printf("[v3] session died during startup session=%s req=%s", sid, reqID)
+				return v3OutcomeColdHang
+			case <-r.Context().Done():
+				return v3OutcomeClientGone
+			case <-coldDeadline:
+				log.Printf("[v3] cold-start watchdog: channel not ready within %s session=%s req=%s", v3Mgr.cfg.ColdStartTimeout, sid, reqID)
+				return v3OutcomeColdHang
+			}
+		}
+
+		// Phase 2: send the turn into the live session and stream the reply.
+		log.Printf("[v3] turn start session=%s req=%s model=%s chat=%s", sid, reqID, model, chatID)
+		v3Mgr.enqueue(sid, v3Msg{ReqID: reqID, Content: content})
+
+		// streamed: flushed ≥1 content chunk (drives the clean-finish-vs-error
+		// choice on abnormal end). committed: got ANY output, so the cold-start
+		// watchdog is satisfied and the idle timeout takes over. lastActivity is
+		// measured from the instant note so the heartbeat shows movement promptly.
+		streamed := false
+		committed := false
+		lastActivity := reqStart
+		idle := time.NewTimer(v3Mgr.cfg.ReplyTotal)
+		defer idle.Stop()
+		for {
+			select {
+			case ev := <-waiter.ch:
+				committed = true
+				lastActivity = time.Now()
+				if !idle.Stop() {
+					select {
+					case <-idle.C:
+					default:
+					}
+				}
+				idle.Reset(v3Mgr.cfg.ReplyTotal)
+				if ev.thinking {
+					v3EmitThinkingDelta(w, flusher, chatID, created, model, ev.text)
+					continue
+				}
+				if !ev.final {
+					v3EmitContentDelta(w, flusher, chatID, created, model, ev.text)
+					if ev.text != "" {
+						streamed = true
+						sessionStore.LogDelta(req.SessionID, ev.text)
+					}
+					continue
+				}
+				v3EmitClose(w, flusher, chatID, created, model, ev.text, includeUsage)
+				if ev.text != "" {
+					sessionStore.LogDelta(req.SessionID, ev.text)
+				}
+				sessionStore.LogDone(req.SessionID, nil)
+				log.Printf("[v3] turn end session=%s req=%s streamed=%v finalLen=%d", sid, reqID, streamed, len(ev.text))
+				return v3OutcomeDone
+			case <-heartbeat.C:
+				if time.Since(lastActivity) >= 12*time.Second {
+					v3EmitThinkingDelta(w, flusher, chatID, created, model,
+						fmt.Sprintf("\n⏳ 处理中…（已 %ds）", int(time.Since(reqStart).Seconds())))
+				} else {
+					fmt.Fprintf(w, ": keepalive\n\n")
+					flusher.Flush()
+				}
+			case <-coldDeadline:
+				if !committed {
+					log.Printf("[v3] cold-start watchdog: no output within %s session=%s req=%s", v3Mgr.cfg.ColdStartTimeout, sid, reqID)
+					return v3OutcomeColdHang
+				}
+				// committed → the turn is alive; the idle timer governs from here.
+			case <-sess.deadCh:
+				if !committed {
+					log.Printf("[v3] session died before any output session=%s req=%s", sid, reqID)
+					return v3OutcomeColdHang
+				}
+				if streamed {
+					v3EmitClose(w, flusher, chatID, created, model, "", includeUsage)
+				} else {
+					fmt.Fprintf(w, "data: %s\n\n", v3ErrChunk(chatID, created, model, "claude session ended"))
+					fmt.Fprintf(w, "data: [DONE]\n\n")
+					flusher.Flush()
+				}
+				sessionStore.LogDone(req.SessionID, nil)
+				log.Printf("[v3] session=%s died mid-turn req=%s streamed=%v", sid, reqID, streamed)
+				return v3OutcomeDone
+			case <-r.Context().Done():
+				log.Printf("[v3] client disconnected session=%s req=%s (session kept alive)", sid, reqID)
+				return v3OutcomeClientGone
+			case <-idle.C:
+				// No claude activity for ReplyTotal AFTER first output → stuck.
+				// ALWAYS surface a visible marker (even mid-stream): never report a
+				// stalled turn as a clean success.
+				v3EmitContentDelta(w, flusher, chatID, created, model, "\n\n⚠️ 任务长时间无新进展，已停止等待。")
+				v3EmitClose(w, flusher, chatID, created, model, "", includeUsage)
+				log.Printf("[v3] idle timeout (no activity %s) session=%s req=%s streamed=%v", v3Mgr.cfg.ReplyTotal, sid, reqID, streamed)
+				return v3OutcomeDone
+			}
 		}
 	}
 
-	// Phase 2: send the turn into the live session.
-	log.Printf("[v3] turn start session=%s req=%s model=%s chat=%s", sid, reqID, model, chatID)
-	v3Mgr.enqueue(sid, v3Msg{ReqID: reqID, Content: content})
-
-	// streamed tracks whether we already flushed ≥1 progressive chunk; if so, an
-	// abnormal end (session death / timeout) finishes the SSE cleanly instead of
-	// overwriting the partial answer with an error.
-	streamed := false
-	// Measure silence from the last visible output (the instant note at reqStart),
-	// not from entering Phase 2 — otherwise the cold-start gap before claude's
-	// first token wrongly counts as "recent activity" and skips the heartbeat.
-	lastActivity := reqStart
-	// Idle-based turn timeout: reset on every claude event so a long-but-
-	// progressing task is never cut. Fires only if claude produces NOTHING
-	// (no progress/chunk/reply) for ReplyTotal — a genuinely stuck session (the
-	// relay heartbeat does NOT reset it). Keeping the SSE open instead of
-	// erroring at an absolute cap is what lets wuji_tools' >10min "switch to
-	// background + push when done" path actually deliver the eventual answer.
-	idle := time.NewTimer(v3Mgr.cfg.ReplyTotal)
-	defer idle.Stop()
-	for {
-		select {
-		case ev := <-waiter.ch:
-			lastActivity = time.Now()
-			if !idle.Stop() {
-				select {
-				case <-idle.C:
-				default:
-				}
-			}
-			idle.Reset(v3Mgr.cfg.ReplyTotal)
-			if ev.thinking {
-				// live progress note (progress tool): emit as a thinking delta,
-				// not part of the answer; do not mark streamed / log as answer.
-				v3EmitThinkingDelta(w, flusher, chatID, created, model, ev.text)
-				continue
-			}
-			if !ev.final {
-				// progressive answer chunk (reply_chunk): flush as a content delta, keep waiting.
-				v3EmitContentDelta(w, flusher, chatID, created, model, ev.text)
-				if ev.text != "" {
-					streamed = true
-					sessionStore.LogDelta(req.SessionID, ev.text)
-				}
-				continue
-			}
-			// terminal reply: emit the final piece (if any) + finish + usage + [DONE].
-			v3EmitClose(w, flusher, chatID, created, model, ev.text, includeUsage)
-			if ev.text != "" {
-				sessionStore.LogDelta(req.SessionID, ev.text)
-			}
-			sessionStore.LogDone(req.SessionID, nil)
-			log.Printf("[v3] turn end session=%s req=%s streamed=%v finalLen=%d", sid, reqID, streamed, len(ev.text))
+	// Cold-start watchdog + retry: if an attempt produces no output within
+	// ColdStartTimeout, the cold-started claude is presumed frozen — kill it,
+	// relaunch a fresh session, and retry the same turn (same reqID/waiter, same
+	// sid → the new bridge re-injects to the same waiter). Give up after one retry.
+	const maxColdRetries = 1
+	for attempt := 0; ; attempt++ {
+		switch runAttempt(sess) {
+		case v3OutcomeDone, v3OutcomeClientGone:
 			return
-		case <-heartbeat.C:
-			// When claude has been silent (heavy work between progress notes),
-			// emit a visible "still working" tick so the client shows movement
-			// instead of looking dead; otherwise a cheap keepalive comment.
-			if time.Since(lastActivity) >= 12*time.Second {
-				v3EmitThinkingDelta(w, flusher, chatID, created, model,
-					fmt.Sprintf("\n⏳ 处理中…（已 %ds）", int(time.Since(reqStart).Seconds())))
-			} else {
-				fmt.Fprintf(w, ": keepalive\n\n")
-				flusher.Flush()
-			}
-		case <-sess.deadCh:
-			if streamed {
+		case v3OutcomeColdHang:
+			if attempt >= maxColdRetries {
+				v3EmitContentDelta(w, flusher, chatID, created, model, "\n\n⚠️ 会话启动多次无响应，请稍后重发。")
 				v3EmitClose(w, flusher, chatID, created, model, "", includeUsage)
-			} else {
-				fmt.Fprintf(w, "data: %s\n\n", v3ErrChunk(chatID, created, model, "claude session ended"))
+				log.Printf("[v3] cold-start give up after %d retries session=%s req=%s", attempt, sid, reqID)
+				return
+			}
+			log.Printf("[v3] cold-start hang → kill+relaunch+retry (attempt %d) session=%s req=%s", attempt+1, sid, reqID)
+			sess.kill()
+			v3Mgr.drainInbox(sid)
+			var aerr error
+			sess, aerr = v3Mgr.acquire(sid, p)
+			if aerr != nil {
+				fmt.Fprintf(w, "data: %s\n\n", v3ErrChunk(chatID, created, model, "relaunch failed: "+aerr.Error()))
 				fmt.Fprintf(w, "data: [DONE]\n\n")
 				flusher.Flush()
+				log.Printf("[v3] cold-start relaunch failed session=%s req=%s: %v", sid, reqID, aerr)
+				return
 			}
-			sessionStore.LogDone(req.SessionID, nil)
-			log.Printf("[v3] session=%s died mid-turn req=%s streamed=%v", sid, reqID, streamed)
-			return
-		case <-r.Context().Done():
-			log.Printf("[v3] client disconnected session=%s req=%s (session kept alive)", sid, reqID)
-			return
-		case <-idle.C:
-			// No claude activity at all for ReplyTotal → treat the session as stuck.
-			// ALWAYS surface a visible marker (even mid-stream): never report a
-			// stalled turn as a clean success, which would mislead the user and let
-			// wuji_tools push a truncated partial answer as "✅ 任务已完成".
-			v3EmitContentDelta(w, flusher, chatID, created, model, "\n\n⚠️ 任务长时间无新进展，已停止等待。")
-			v3EmitClose(w, flusher, chatID, created, model, "", includeUsage)
-			log.Printf("[v3] idle timeout (no activity %s) session=%s req=%s streamed=%v", v3Mgr.cfg.ReplyTotal, sid, reqID, streamed)
-			return
+			sess.inTurn.Store(true)
+			v3EmitThinkingDelta(w, flusher, chatID, created, model, "\n⏳ 会话启动异常，正在重启会话重试…")
 		}
 	}
 }
