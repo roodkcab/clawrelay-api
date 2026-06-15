@@ -112,7 +112,13 @@ func newV3Manager(cfg v3Config) *v3Manager {
 		cfg.MaxSessions = 30
 	}
 	if cfg.ReplyTotal <= 0 {
-		cfg.ReplyTotal = 10 * time.Minute
+		// IDLE timeout (reset on every claude event), staggered well ABOVE
+		// wuji_tools' agent_timeout (600s, when it switches to background +
+		// push-when-done). If the relay closed the SSE at the same ~600s, it
+		// would poison wuji's background path with a timeout error and drop the
+		// genuine slow answer. 20min leaves that path ~10min of headroom to
+		// deliver a single silent >10min step.
+		cfg.ReplyTotal = 20 * time.Minute
 	}
 	return &v3Manager{
 		cfg:      cfg,
@@ -759,13 +765,11 @@ waitReady:
 			return
 		case <-idle.C:
 			// No claude activity at all for ReplyTotal → treat the session as stuck.
-			if streamed {
-				v3EmitClose(w, flusher, chatID, created, model, "", includeUsage)
-			} else {
-				fmt.Fprintf(w, "data: %s\n\n", v3ErrChunk(chatID, created, model, "任务长时间无响应"))
-				fmt.Fprintf(w, "data: [DONE]\n\n")
-				flusher.Flush()
-			}
+			// ALWAYS surface a visible marker (even mid-stream): never report a
+			// stalled turn as a clean success, which would mislead the user and let
+			// wuji_tools push a truncated partial answer as "✅ 任务已完成".
+			v3EmitContentDelta(w, flusher, chatID, created, model, "\n\n⚠️ 任务长时间无新进展，已停止等待。")
+			v3EmitClose(w, flusher, chatID, created, model, "", includeUsage)
 			log.Printf("[v3] idle timeout (no activity %s) session=%s req=%s streamed=%v", v3Mgr.cfg.ReplyTotal, sid, reqID, streamed)
 			return
 		}
