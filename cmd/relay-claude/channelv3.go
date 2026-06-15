@@ -254,6 +254,20 @@ func (m *v3Manager) enqueue(sid string, msg v3Msg) {
 	m.inboxFor(sid) <- msg
 }
 
+// killSession kills the interactive claude (+ its bun bridge) for sid and removes
+// it from the manager (sessions + inbox). Used to tear down a one-off ephemeral
+// session at turn end so it doesn't linger as a heavy unreusable process.
+func (m *v3Manager) killSession(sid string) {
+	m.mu.Lock()
+	s := m.sessions[sid]
+	delete(m.sessions, sid)
+	delete(m.inbox, sid)
+	m.mu.Unlock()
+	if s != nil {
+		s.kill()
+	}
+}
+
 // drainInbox empties any undelivered inbound turns for a session — used before a
 // cold-start retry so the relaunched bridge doesn't inject a stale duplicate.
 func (m *v3Manager) drainInbox(sid string) {
@@ -317,12 +331,12 @@ func (m *v3Manager) acquire(sid string, p v3SpawnParams) (*v3Session, error) {
 	if m.cfg.MaxSessions > 0 {
 		alive := 0
 		for _, s := range m.sessions {
-			if !s.Dead() && !s.inTurn.Load() {
-				alive++
+			if !s.Dead() {
+				alive++ // count ALL live sessions (incl. inTurn) toward the cap
 			}
 		}
 		if alive >= m.cfg.MaxSessions {
-			m.evictOldestLocked()
+			m.evictOldestLocked() // frees an idle session if any; logs if all busy
 		}
 	}
 	m.mu.Unlock()
@@ -539,6 +553,9 @@ func (m *v3Manager) evictOldestLocked() {
 		}
 	}
 	if oldest == "" {
+		// At capacity but every session is mid-turn — nothing safe to evict.
+		// Launch anyway (brief over-cap); turn-end / reaper reclaim slots soon.
+		log.Printf("[v3] at capacity (%d) but all sessions busy; launching over-cap", m.cfg.MaxSessions)
 		return
 	}
 	s := m.sessions[oldest]
@@ -620,8 +637,9 @@ func v3ReqID() string {
 // interactive (subscription-billed) claude session via the channel bridge.
 func handleChannelV3Response(w http.ResponseWriter, r *http.Request, req *openai.ChatCompletionRequest, model string, includeUsage bool) {
 	sid := req.SessionID
-	if sid == "" {
-		sid = newUUID() // ephemeral one-off session
+	ephemeral := sid == "" // no session_id (e.g. cron) → one-off, never reusable
+	if ephemeral {
+		sid = newUUID()
 	}
 	systemPrompt := extractSystemPrompt(req.Messages)
 
@@ -662,6 +680,13 @@ func handleChannelV3Response(w http.ResponseWriter, r *http.Request, req *openai
 	}
 	sess.inTurn.Store(true)
 	defer func() { sess.inTurn.Store(false); sess.markUsed() }()
+	// One-off (no-session, e.g. cron) sessions are never reusable — tear the
+	// interactive claude + bun bridge down at turn end instead of leaking a heavy
+	// process until the idle reaper fires. (sid is captured; a cold-start retry
+	// reassigns sess but keeps sid, so this kills whatever is mapped to sid.)
+	if ephemeral {
+		defer v3Mgr.killSession(sid)
+	}
 
 	reqID := v3ReqID()
 	waiter := v3Mgr.registerWaiter(reqID)
