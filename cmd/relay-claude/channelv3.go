@@ -690,11 +690,25 @@ waitReady:
 	// not from entering Phase 2 — otherwise the cold-start gap before claude's
 	// first token wrongly counts as "recent activity" and skips the heartbeat.
 	lastActivity := reqStart
-	deadline := time.After(v3Mgr.cfg.ReplyTotal)
+	// Idle-based turn timeout: reset on every claude event so a long-but-
+	// progressing task is never cut. Fires only if claude produces NOTHING
+	// (no progress/chunk/reply) for ReplyTotal — a genuinely stuck session (the
+	// relay heartbeat does NOT reset it). Keeping the SSE open instead of
+	// erroring at an absolute cap is what lets wuji_tools' >10min "switch to
+	// background + push when done" path actually deliver the eventual answer.
+	idle := time.NewTimer(v3Mgr.cfg.ReplyTotal)
+	defer idle.Stop()
 	for {
 		select {
 		case ev := <-waiter.ch:
 			lastActivity = time.Now()
+			if !idle.Stop() {
+				select {
+				case <-idle.C:
+				default:
+				}
+			}
+			idle.Reset(v3Mgr.cfg.ReplyTotal)
 			if ev.thinking {
 				// live progress note (progress tool): emit as a thinking delta,
 				// not part of the answer; do not mark streamed / log as answer.
@@ -743,15 +757,16 @@ waitReady:
 		case <-r.Context().Done():
 			log.Printf("[v3] client disconnected session=%s req=%s (session kept alive)", sid, reqID)
 			return
-		case <-deadline:
+		case <-idle.C:
+			// No claude activity at all for ReplyTotal → treat the session as stuck.
 			if streamed {
 				v3EmitClose(w, flusher, chatID, created, model, "", includeUsage)
 			} else {
-				fmt.Fprintf(w, "data: %s\n\n", v3ErrChunk(chatID, created, model, "reply timeout"))
+				fmt.Fprintf(w, "data: %s\n\n", v3ErrChunk(chatID, created, model, "任务长时间无响应"))
 				fmt.Fprintf(w, "data: [DONE]\n\n")
 				flusher.Flush()
 			}
-			log.Printf("[v3] reply timeout session=%s req=%s streamed=%v", sid, reqID, streamed)
+			log.Printf("[v3] idle timeout (no activity %s) session=%s req=%s streamed=%v", v3Mgr.cfg.ReplyTotal, sid, reqID, streamed)
 			return
 		}
 	}
