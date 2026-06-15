@@ -640,7 +640,16 @@ func handleChannelV3Response(w http.ResponseWriter, r *http.Request, req *openai
 	fmt.Fprintf(w, ": ping\n\n")
 	flusher.Flush()
 
-	heartbeat := time.NewTicker(20 * time.Second)
+	// Instant feedback so the client never shows a frozen blank while the
+	// session cold-starts or claude thinks before its first output.
+	reqStart := time.Now()
+	v3EmitThinkingDelta(w, flusher, chatID, created, model, "🤔 正在处理你的请求…")
+
+	// Heartbeat: interactive claude can be silent for minutes during heavy work
+	// (tool calls, big queries). A short visible "still working" thinking tick
+	// keeps the client alive (covers the adapter's sock_read idle timeout) AND
+	// shows movement so it never looks dead.
+	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
 
 	// Phase 1: wait until the session's channel is live (first launch only).
@@ -651,8 +660,8 @@ waitReady:
 		case <-sess.ready:
 			break waitReady
 		case <-heartbeat.C:
-			fmt.Fprintf(w, ": keepalive\n\n")
-			flusher.Flush()
+			v3EmitThinkingDelta(w, flusher, chatID, created, model,
+				fmt.Sprintf("\n⏳ 正在准备会话…（已 %ds）", int(time.Since(reqStart).Seconds())))
 		case <-sess.deadCh:
 			fmt.Fprintf(w, "data: %s\n\n", v3ErrChunk(chatID, created, model, "claude session ended during startup"))
 			fmt.Fprintf(w, "data: [DONE]\n\n")
@@ -677,10 +686,12 @@ waitReady:
 	// abnormal end (session death / timeout) finishes the SSE cleanly instead of
 	// overwriting the partial answer with an error.
 	streamed := false
+	lastActivity := time.Now()
 	deadline := time.After(v3Mgr.cfg.ReplyTotal)
 	for {
 		select {
 		case ev := <-waiter.ch:
+			lastActivity = time.Now()
 			if ev.thinking {
 				// live progress note (progress tool): emit as a thinking delta,
 				// not part of the answer; do not mark streamed / log as answer.
@@ -705,8 +716,16 @@ waitReady:
 			log.Printf("[v3] turn end session=%s req=%s streamed=%v finalLen=%d", sid, reqID, streamed, len(ev.text))
 			return
 		case <-heartbeat.C:
-			fmt.Fprintf(w, ": keepalive\n\n")
-			flusher.Flush()
+			// When claude has been silent (heavy work between progress notes),
+			// emit a visible "still working" tick so the client shows movement
+			// instead of looking dead; otherwise a cheap keepalive comment.
+			if time.Since(lastActivity) >= 12*time.Second {
+				v3EmitThinkingDelta(w, flusher, chatID, created, model,
+					fmt.Sprintf("\n⏳ 处理中…（已 %ds）", int(time.Since(reqStart).Seconds())))
+			} else {
+				fmt.Fprintf(w, ": keepalive\n\n")
+				flusher.Flush()
+			}
 		case <-sess.deadCh:
 			if streamed {
 				v3EmitClose(w, flusher, chatID, created, model, "", includeUsage)

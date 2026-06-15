@@ -51,9 +51,11 @@ const mcp = new Server(
       'exactly as you would for a user typing directly. ' +
       'CRITICAL OUTPUT PROTOCOL — keep the user updated live, NEVER go silent:\n' +
       '1) The MOMENT you start (before any tool call, lookup, or long thinking), call ' +
-      '`progress` with a short status note (e.g. "在的，正在查库存…"), and call it again ' +
-      'with brief updates as you work ("已取到数据，整理中…"). These show as live progress ' +
-      'and are NOT part of your answer — use them freely so the user never waits in silence.\n' +
+      '`progress` with a short status note (e.g. "在的，正在查库存…"). Then send a `progress` ' +
+      'update before EVERY tool call and whenever a step will take more than a moment, narrating ' +
+      'what you are doing ("正在查 stock 表…", "已取 1200 条，按仓库汇总…", "正在算总货值…"). For ' +
+      'long multi-step work, keep them coming so there is never a long silent gap. These show as ' +
+      'live progress and are NOT part of your answer — use them freely so the user never feels stuck.\n' +
       '2) Stream your ANSWER through `reply_chunk`, in SMALL pieces — roughly one sentence ' +
       'or short clause per call, AS you write it, each carrying ONLY the new text since your ' +
       'previous chunk (NEVER repeat earlier text). Send the FIRST reply_chunk as soon as you ' +
