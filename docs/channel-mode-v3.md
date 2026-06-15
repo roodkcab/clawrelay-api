@@ -1,5 +1,7 @@
 # relay-claude V3 — 交互式（订阅计费）Claude via Channels
 
+> **发布版本：relay-claude v2.0.0**（channelv3 即 V3 的正式发布形态；早期 interim 构建曾以 1.2.0 运行）。订阅版实例 `/health` 返回 `"version":"2.0.0"` + `"mode":"channelv3"`。
+
 ## 0. 为什么有 V3
 
 Claude Code 的**非交互模式**（`-p` / headless，含 V1/V2 的 stream-json）**不再能使用订阅（Max/Pro）token 量**。V3 改为驱动**交互式 claude 会话**（计入订阅），通过 Claude Code 的 [channels](https://code.claude.com/docs/en/channels) 特性收发消息。**对外 OpenAI HTTP/SSE 接口不变。**
