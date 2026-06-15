@@ -423,7 +423,7 @@ var v3Prompts = []struct {
 	re  *regexp.Regexp
 }{
 	{"devchannels", regexp.MustCompile(`(?i)using this for local development`)},
-	{"trust", regexp.MustCompile(`(?i)do you trust|trust the files`)},
+	{"trust", regexp.MustCompile(`(?i)do you trust|trust the files|trust this folder|trust this project|created or one you trust`)},
 	{"bypass", regexp.MustCompile(`(?i)yes, i accept|bypass permissions`)},
 	{"mcpconsent", regexp.MustCompile(`(?i)new mcp server|use this mcp server`)},
 }
