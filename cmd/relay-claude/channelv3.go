@@ -686,7 +686,10 @@ waitReady:
 	// abnormal end (session death / timeout) finishes the SSE cleanly instead of
 	// overwriting the partial answer with an error.
 	streamed := false
-	lastActivity := time.Now()
+	// Measure silence from the last visible output (the instant note at reqStart),
+	// not from entering Phase 2 — otherwise the cold-start gap before claude's
+	// first token wrongly counts as "recent activity" and skips the heartbeat.
+	lastActivity := reqStart
 	deadline := time.After(v3Mgr.cfg.ReplyTotal)
 	for {
 		select {
