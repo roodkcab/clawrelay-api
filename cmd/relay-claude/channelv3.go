@@ -47,13 +47,16 @@ type v3Msg struct {
 	Content string `json:"content"`
 }
 
-// v3ReplyEvent is one piece of a turn's answer routed back to the frontend:
-// a streaming chunk (final=false, emitted as an SSE delta) or the terminal
-// reply (final=true, which ends the turn). Streaming chunks come from the
-// bridge's reply_chunk tool; the terminal reply from the reply tool.
+// v3ReplyEvent is one piece of a turn routed back to the frontend:
+//   - thinking=true: a live progress note (bridge `progress` tool), emitted as a
+//     thinking delta — shown as transient progress, NOT part of the answer.
+//   - final=false (and thinking=false): a streaming answer chunk (bridge
+//     `reply_chunk` tool), emitted as an SSE content delta.
+//   - final=true: the terminal reply (bridge `reply` tool), which ends the turn.
 type v3ReplyEvent struct {
-	text  string
-	final bool
+	text     string
+	final    bool
+	thinking bool
 }
 
 // v3Waiter receives a turn's reply events. ch is buffered and NEVER closed —
@@ -132,6 +135,7 @@ func (m *v3Manager) startControlServer() error {
 	mux.HandleFunc("/v3/next", m.handleNext)
 	mux.HandleFunc("/v3/reply", m.handleReply)
 	mux.HandleFunc("/v3/reply_chunk", m.handleReplyChunk)
+	mux.HandleFunc("/v3/progress", m.handleProgress)
 	srv := &http.Server{Handler: mux}
 	go func() {
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -164,17 +168,23 @@ func (m *v3Manager) handleNext(w http.ResponseWriter, r *http.Request) {
 // handleReply routes the TERMINAL reply (from the bridge's reply tool) to the
 // waiting frontend; it ends the turn.
 func (m *v3Manager) handleReply(w http.ResponseWriter, r *http.Request) {
-	m.routeReply(w, r, true)
+	m.routeReply(w, r, v3ReplyEvent{final: true})
 }
 
-// handleReplyChunk routes a streaming partial chunk (from the bridge's
-// reply_chunk tool) so the frontend can flush it as an SSE delta for
-// progressive output; it does NOT end the turn.
+// handleReplyChunk routes a streaming answer chunk (from the bridge's
+// reply_chunk tool) so the frontend can flush it as an SSE content delta; it
+// does NOT end the turn.
 func (m *v3Manager) handleReplyChunk(w http.ResponseWriter, r *http.Request) {
-	m.routeReply(w, r, false)
+	m.routeReply(w, r, v3ReplyEvent{})
 }
 
-func (m *v3Manager) routeReply(w http.ResponseWriter, r *http.Request, final bool) {
+// handleProgress routes a live status note (from the bridge's progress tool),
+// emitted as a thinking delta — transient progress, not part of the answer.
+func (m *v3Manager) handleProgress(w http.ResponseWriter, r *http.Request) {
+	m.routeReply(w, r, v3ReplyEvent{thinking: true})
+}
+
+func (m *v3Manager) routeReply(w http.ResponseWriter, r *http.Request, ev v3ReplyEvent) {
 	var body struct {
 		ReqID string `json:"req_id"`
 		Text  string `json:"text"`
@@ -183,7 +193,8 @@ func (m *v3Manager) routeReply(w http.ResponseWriter, r *http.Request, final boo
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
-	if m.deliver(body.ReqID, v3ReplyEvent{text: body.Text, final: final}) {
+	ev.text = body.Text
+	if m.deliver(body.ReqID, ev) {
 		w.WriteHeader(http.StatusOK)
 	} else {
 		http.Error(w, "no waiter", http.StatusNotFound)
@@ -670,8 +681,14 @@ waitReady:
 	for {
 		select {
 		case ev := <-waiter.ch:
+			if ev.thinking {
+				// live progress note (progress tool): emit as a thinking delta,
+				// not part of the answer; do not mark streamed / log as answer.
+				v3EmitThinkingDelta(w, flusher, chatID, created, model, ev.text)
+				continue
+			}
 			if !ev.final {
-				// progressive streaming chunk (reply_chunk): flush as a delta, keep waiting.
+				// progressive answer chunk (reply_chunk): flush as a content delta, keep waiting.
 				v3EmitContentDelta(w, flusher, chatID, created, model, ev.text)
 				if ev.text != "" {
 					streamed = true
@@ -716,6 +733,24 @@ waitReady:
 			return
 		}
 	}
+}
+
+// v3EmitThinkingDelta sends one live progress note as a thinking delta
+// (delta.thinking, empty content). Clients render it as transient progress, not
+// as part of the answer. Does NOT finish the turn.
+func v3EmitThinkingDelta(w http.ResponseWriter, flusher http.Flusher, chatID string, created int64, model, text string) {
+	if text == "" {
+		return
+	}
+	msg := openai.NewChatMessage("assistant", "")
+	msg.Thinking = text
+	chunk := openai.ChatCompletionResponse{
+		ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
+		Choices: []openai.ChatCompletionChoice{{Index: 0, Delta: msg}},
+	}
+	data, _ := json.Marshal(chunk)
+	fmt.Fprintf(w, "data: %s\n\n", data)
+	flusher.Flush()
 }
 
 // v3EmitContentDelta sends one progressive assistant content delta (a streaming

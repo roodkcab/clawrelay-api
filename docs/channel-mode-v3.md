@@ -59,7 +59,7 @@ wuji_tools → relay :50008 (OpenAI HTTP/SSE，不变)
 
 V3 做不到"真·逐 token"流式：交互 TUI 无结构化输出口，token 增量被 `claude --help` 明确绑死在 `--print` + `--output-format=stream-json`，而那是非交互、丢订阅计费的路。折中：bridge 增设 `reply_chunk` 工具，claude 边写边按句/段多次调用，relay 每收到一段就 flush 一个 OpenAI SSE delta；最后 `reply` 空串收尾。**对外 OpenAI SSE 接口不变**（就是变成多个 content delta，和 V2 token 流式同一条消费路径）。
 
-- **协议**：`POST /v3/reply_chunk?session=<sid> {req_id,text}`（非终态 delta）+ `POST /v3/reply`（终态，结束 turn）。waiter 从 `chan string` 改为 `chan v3ReplyEvent{text,final}`；buffered `ch` **永不 close**，sender 在 `deliver()` 里用 `done` 兜底（沿用 V2 防 send-on-closed 不变量）。
+- **协议**：三个 channel 工具 →三个端点：`progress`→`/v3/progress`（**thinking delta**，实时进度，不进答案）、`reply_chunk`→`/v3/reply_chunk`（content delta，答案分段）、`reply`→`/v3/reply`（终态，结束 turn）。waiter 用 `chan v3ReplyEvent{text,final,thinking}`；buffered `ch` **永不 close**，sender 在 `deliver()` 里用 `done` 兜底（沿用 V2 防 send-on-closed 不变量）。progress 走 `delta.thinking`（空 content），wuji_tools adapter `if thinking:` 解析为 ThinkingDelta、显示在思考块，不污染 `accumulated_text`（答案）。
 - **效果**（claude01 实测，opus）：4 点结构化答案 → 4 段流式，首字 23.7s → **14.7s**；暖 session follow-up 首字 **4.6s**、3 段；短答案不过度切分（1 段）。bridge 日志可见 `N×reply_chunk + 1×reply(len=0)`。
 - **取舍**：段级 ≠ token 级；每段一次工具往返，**总时长略增**；**强依赖 bridge `instructions` 的强制措辞**——弱措辞下 opus 完全不分段（实测一次性 `reply`）。设计了**优雅降级**：不配合时退回单段（= 原 V3 整段行为），永不出错。
 - **关键坑**：channel server 的 `instructions` 必须强制口吻（"MUST stream / 多点答案=多次 reply_chunk / 单段是错的"），否则 opus 默认一次性 `reply`，`reply_chunk` 形同虚设。

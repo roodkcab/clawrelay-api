@@ -49,23 +49,42 @@ const mcp = new Server(
       'user input. Engage fully and normally: answer questions, recall and use ' +
       'earlier turns of THIS ongoing conversation, run your tools and skills — ' +
       'exactly as you would for a user typing directly. ' +
-      'CRITICAL OUTPUT PROTOCOL — you MUST stream your answer, never dump it at once. ' +
-      'Deliver your answer as a SEQUENCE of `reply_chunk` calls: emit one call per ' +
-      'sentence or short paragraph, AS you compose it, each carrying ONLY the new text ' +
-      'since your previous chunk (NEVER repeat earlier text). Unless your entire answer ' +
-      'is a single short sentence, you MUST make MULTIPLE `reply_chunk` calls (e.g. a ' +
-      '4-point answer = at least 4 reply_chunk calls). Putting the whole answer into one ' +
-      '`reply_chunk`, or into `reply`, is WRONG and defeats streaming. After your last ' +
-      'reply_chunk, call `reply` EXACTLY ONCE with the SAME req_id and `text` set to an ' +
-      'empty string (or only the final trailing words if any remain) to END the turn. ' +
-      'The user sees the concatenation of all chunks plus the final reply, so it must ' +
-      'read as one clean answer with no duplication. Reply ONLY through these tools; the ' +
-      'req_id routes your answer back to the user.',
+      'CRITICAL OUTPUT PROTOCOL — keep the user updated live, NEVER go silent:\n' +
+      '1) The MOMENT you start (before any tool call, lookup, or long thinking), call ' +
+      '`progress` with a short status note (e.g. "在的，正在查库存…"), and call it again ' +
+      'with brief updates as you work ("已取到数据，整理中…"). These show as live progress ' +
+      'and are NOT part of your answer — use them freely so the user never waits in silence.\n' +
+      '2) Stream your ANSWER through `reply_chunk`, in SMALL pieces — roughly one sentence ' +
+      'or short clause per call, AS you write it, each carrying ONLY the new text since your ' +
+      'previous chunk (NEVER repeat earlier text). Send the FIRST reply_chunk as soon as you ' +
+      'have your opening words — do NOT wait to compose the whole answer. Unless the entire ' +
+      'answer is one short sentence, make MANY small reply_chunk calls; a few big chunks is ' +
+      'too coarse, and putting the whole answer in one call defeats streaming.\n' +
+      '3) Finish with `reply` EXACTLY ONCE (same req_id), `text` set to an empty string (or ' +
+      'only the final trailing words if any remain). The user sees the concatenation of your ' +
+      'reply_chunks plus the final reply as ONE clean answer with no duplication; progress ' +
+      'notes stay separate. Reply ONLY through these tools; the req_id routes your output back.',
   },
 )
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
+    {
+      name: 'progress',
+      description:
+        'Post a SHORT live status note so the user knows you are working — shown as transient ' +
+        'progress, NOT part of your final answer. Call it the moment you start, and again before/while ' +
+        'doing tool calls, lookups, or anything that takes more than a moment (e.g. "在的，正在查库存…", ' +
+        '"已取到数据，整理中…"). Keep each note to a short phrase.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          req_id: { type: 'string', description: 'The req_id attribute from the inbound <channel> tag you are answering' },
+          text: { type: 'string', description: 'A short live status phrase (not part of the answer)' },
+        },
+        required: ['req_id', 'text'],
+      },
+    },
     {
       name: 'reply_chunk',
       description:
@@ -100,11 +119,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }))
 
+const TOOL_PATHS: Record<string, string> = {
+  reply: '/v3/reply',
+  reply_chunk: '/v3/reply_chunk',
+  progress: '/v3/progress',
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const name = req.params.name
-  if (name === 'reply' || name === 'reply_chunk') {
+  const path = TOOL_PATHS[name]
+  if (path) {
     const { req_id, text } = (req.params.arguments ?? {}) as { req_id: string; text: string }
-    const path = name === 'reply_chunk' ? '/v3/reply_chunk' : '/v3/reply'
     log(name, 'req_id=', req_id, 'len=', (text ?? '').length)
     try {
       const r = await fetch(CTRL + path + '?session=' + encodeURIComponent(SID), {
@@ -116,7 +141,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     } catch (e) {
       log(name + ' POST failed', e)
     }
-    return { content: [{ type: 'text', text: name === 'reply_chunk' ? 'chunk delivered' : 'delivered' }] }
+    return { content: [{ type: 'text', text: name === 'reply' ? 'delivered' : 'ok' }] }
   }
   throw new Error('unknown tool: ' + req.params.name)
 })
