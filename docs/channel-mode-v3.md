@@ -93,6 +93,9 @@ V3 冷启动 claude 会弹「Is this a project you created or one you trust? / Y
 ### 6.4 `.mcp.json` 权限
 bridge 往 bot working_dir 写 `.mcp.json`。`/data/skills/*` 多为 owner 各异但 **group=`claude`、组可写** → 跨实例可写。唯一会失败：已存在一个**非组可写的旧 `.mcp.json`**（如 claude01 早期 umask 建的）挡覆盖——窄边界，按需 chmod g+w 或删掉重建。
 
-### 6.5 仍未做（已知遗留）
-- **B 冷启动 watchdog**：预信任解决"信任类"卡死，但**偶发的非信任卡死仍在**（实测一次 claude 冷启动冻在 "Checking for updates"，20min 才被 #5 兜底）。建议加 `ready 后 ~90s 零输出 → 判卡死 → 杀掉重启重试一次` 的自愈。
-- **超时"✅ 任务已完成"重复推送** 的 cosmetic（wuji_tools 侧后台推送 + 前台完成各推一次）。
+### 6.5 冷启动 watchdog（已实现）
+
+预信任解决"信任类"冷启动卡死，但仍有**偶发的非信任卡死**（实测一次 claude 冷启动冻在 "Checking for updates"，旧版要 20min 才被 idle 兜底）。已加 **cold-start watchdog**（`ColdStartTimeout`，默认 **5min**，env `V3_COLD_START_TIMEOUT` 覆盖）：每个 turn 必须在该窗口内产出**首个输出**（覆盖 channel 一直 not-ready 和 ready 后冻住两种）；超时即判冷启动冻死 → **kill 会话 + drainInbox + relaunch + 重试同一 turn**（同 reqID/waiter/sid，新 bridge 重新注入同一 waiter），重试仍冻死才 `⚠️ 会话启动多次无响应，请稍后重发。`。一旦有任何输出即 **committed**，之后交给 idle 超时（`ReplyTotal`），长任务不受影响。实现：`handleChannelV3Response` 的 Phase1+Phase2 抽成 `runAttempt()` 闭包返回 done/coldHang/clientGone，外层重试。生产 8 实例已部署（重试上限 `maxColdRetries=1`）。
+
+### 6.6 仍未做（已知遗留）
+- **超时"✅ 任务已完成"重复推送** 的 cosmetic（wuji_tools 侧后台推送 + 前台完成各推一次，导致 ⚠️ 被两条 ✅ 夹住、自相矛盾）。
