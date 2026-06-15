@@ -47,6 +47,24 @@ type v3Msg struct {
 	Content string `json:"content"`
 }
 
+// v3ReplyEvent is one piece of a turn's answer routed back to the frontend:
+// a streaming chunk (final=false, emitted as an SSE delta) or the terminal
+// reply (final=true, which ends the turn). Streaming chunks come from the
+// bridge's reply_chunk tool; the terminal reply from the reply tool.
+type v3ReplyEvent struct {
+	text  string
+	final bool
+}
+
+// v3Waiter receives a turn's reply events. ch is buffered and NEVER closed —
+// senders guard on done instead, so a late bridge POST can never send on a
+// closed channel (the V2 send-on-closed class of bug). done is closed once by
+// the frontend (via unregisterWaiter) when it stops reading.
+type v3Waiter struct {
+	ch   chan v3ReplyEvent
+	done chan struct{}
+}
+
 // v3Session wraps one interactive claude process (+ its channel bridge).
 type v3Session struct {
 	sid       string
@@ -79,8 +97,8 @@ type v3Manager struct {
 
 	mu       sync.Mutex
 	sessions map[string]*v3Session
-	inbox    map[string]chan v3Msg  // sid -> queued inbound turns (drained by /v3/next)
-	waiters  map[string]chan string // req_id -> reply text waiter (delivered by /v3/reply)
+	inbox    map[string]chan v3Msg // sid -> queued inbound turns (drained by /v3/next)
+	waiters  map[string]*v3Waiter  // req_id -> reply waiter (chunks + final reply)
 }
 
 func newV3Manager(cfg v3Config) *v3Manager {
@@ -97,7 +115,7 @@ func newV3Manager(cfg v3Config) *v3Manager {
 		cfg:      cfg,
 		sessions: make(map[string]*v3Session),
 		inbox:    make(map[string]chan v3Msg),
-		waiters:  make(map[string]chan string),
+		waiters:  make(map[string]*v3Waiter),
 	}
 }
 
@@ -113,6 +131,7 @@ func (m *v3Manager) startControlServer() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v3/next", m.handleNext)
 	mux.HandleFunc("/v3/reply", m.handleReply)
+	mux.HandleFunc("/v3/reply_chunk", m.handleReplyChunk)
 	srv := &http.Server{Handler: mux}
 	go func() {
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -142,8 +161,20 @@ func (m *v3Manager) handleNext(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleReply routes a reply from the bridge to the waiting frontend request.
+// handleReply routes the TERMINAL reply (from the bridge's reply tool) to the
+// waiting frontend; it ends the turn.
 func (m *v3Manager) handleReply(w http.ResponseWriter, r *http.Request) {
+	m.routeReply(w, r, true)
+}
+
+// handleReplyChunk routes a streaming partial chunk (from the bridge's
+// reply_chunk tool) so the frontend can flush it as an SSE delta for
+// progressive output; it does NOT end the turn.
+func (m *v3Manager) handleReplyChunk(w http.ResponseWriter, r *http.Request) {
+	m.routeReply(w, r, false)
+}
+
+func (m *v3Manager) routeReply(w http.ResponseWriter, r *http.Request, final bool) {
 	var body struct {
 		ReqID string `json:"req_id"`
 		Text  string `json:"text"`
@@ -152,18 +183,30 @@ func (m *v3Manager) handleReply(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
-	m.mu.Lock()
-	ch := m.waiters[body.ReqID]
-	m.mu.Unlock()
-	if ch == nil {
+	if m.deliver(body.ReqID, v3ReplyEvent{text: body.Text, final: final}) {
+		w.WriteHeader(http.StatusOK)
+	} else {
 		http.Error(w, "no waiter", http.StatusNotFound)
-		return
+	}
+}
+
+// deliver hands a reply event to the waiting frontend. It blocks only until the
+// frontend accepts it (the channel is buffered, so normally instant) or the
+// frontend has gone away — so a streaming chunk is never silently dropped while
+// the frontend is still reading.
+func (m *v3Manager) deliver(reqID string, ev v3ReplyEvent) bool {
+	m.mu.Lock()
+	wt := m.waiters[reqID]
+	m.mu.Unlock()
+	if wt == nil {
+		return false
 	}
 	select {
-	case ch <- body.Text:
-	default: // waiter already satisfied/abandoned
+	case wt.ch <- ev:
+		return true
+	case <-wt.done:
+		return false
 	}
-	w.WriteHeader(http.StatusOK)
 }
 
 func (m *v3Manager) inboxFor(sid string) chan v3Msg {
@@ -181,18 +224,22 @@ func (m *v3Manager) enqueue(sid string, msg v3Msg) {
 	m.inboxFor(sid) <- msg
 }
 
-func (m *v3Manager) registerWaiter(reqID string) chan string {
-	ch := make(chan string, 1)
+func (m *v3Manager) registerWaiter(reqID string) *v3Waiter {
+	wt := &v3Waiter{ch: make(chan v3ReplyEvent, 256), done: make(chan struct{})}
 	m.mu.Lock()
-	m.waiters[reqID] = ch
+	m.waiters[reqID] = wt
 	m.mu.Unlock()
-	return ch
+	return wt
 }
 
 func (m *v3Manager) unregisterWaiter(reqID string) {
 	m.mu.Lock()
+	wt := m.waiters[reqID]
 	delete(m.waiters, reqID)
 	m.mu.Unlock()
+	if wt != nil {
+		close(wt.done) // release any sender blocked in deliver()
+	}
 }
 
 // v3SpawnParams is the spawn-time config derived from the first request.
@@ -565,7 +612,7 @@ func handleChannelV3Response(w http.ResponseWriter, r *http.Request, req *openai
 	defer func() { sess.inTurn.Store(false); sess.markUsed() }()
 
 	reqID := v3ReqID()
-	replyCh := v3Mgr.registerWaiter(reqID)
+	waiter := v3Mgr.registerWaiter(reqID)
 	defer v3Mgr.unregisterWaiter(reqID)
 
 	// SSE headers + initial ping (also keeps the client alive during a slow
@@ -615,54 +662,98 @@ waitReady:
 	log.Printf("[v3] turn start session=%s req=%s model=%s chat=%s", sid, reqID, model, chatID)
 	v3Mgr.enqueue(sid, v3Msg{ReqID: reqID, Content: content})
 
+	// streamed tracks whether we already flushed ≥1 progressive chunk; if so, an
+	// abnormal end (session death / timeout) finishes the SSE cleanly instead of
+	// overwriting the partial answer with an error.
+	streamed := false
 	deadline := time.After(v3Mgr.cfg.ReplyTotal)
 	for {
 		select {
-		case text := <-replyCh:
-			v3EmitReply(w, flusher, chatID, created, model, text, includeUsage)
-			sessionStore.LogDelta(req.SessionID, text)
+		case ev := <-waiter.ch:
+			if !ev.final {
+				// progressive streaming chunk (reply_chunk): flush as a delta, keep waiting.
+				v3EmitContentDelta(w, flusher, chatID, created, model, ev.text)
+				if ev.text != "" {
+					streamed = true
+					sessionStore.LogDelta(req.SessionID, ev.text)
+				}
+				continue
+			}
+			// terminal reply: emit the final piece (if any) + finish + usage + [DONE].
+			v3EmitClose(w, flusher, chatID, created, model, ev.text, includeUsage)
+			if ev.text != "" {
+				sessionStore.LogDelta(req.SessionID, ev.text)
+			}
 			sessionStore.LogDone(req.SessionID, nil)
-			log.Printf("[v3] turn end session=%s req=%s len=%d", sid, reqID, len(text))
+			log.Printf("[v3] turn end session=%s req=%s streamed=%v finalLen=%d", sid, reqID, streamed, len(ev.text))
 			return
 		case <-heartbeat.C:
 			fmt.Fprintf(w, ": keepalive\n\n")
 			flusher.Flush()
 		case <-sess.deadCh:
-			fmt.Fprintf(w, "data: %s\n\n", v3ErrChunk(chatID, created, model, "claude session ended"))
-			fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
-			log.Printf("[v3] session=%s died mid-turn req=%s", sid, reqID)
+			if streamed {
+				v3EmitClose(w, flusher, chatID, created, model, "", includeUsage)
+			} else {
+				fmt.Fprintf(w, "data: %s\n\n", v3ErrChunk(chatID, created, model, "claude session ended"))
+				fmt.Fprintf(w, "data: [DONE]\n\n")
+				flusher.Flush()
+			}
+			sessionStore.LogDone(req.SessionID, nil)
+			log.Printf("[v3] session=%s died mid-turn req=%s streamed=%v", sid, reqID, streamed)
 			return
 		case <-r.Context().Done():
 			log.Printf("[v3] client disconnected session=%s req=%s (session kept alive)", sid, reqID)
 			return
 		case <-deadline:
-			fmt.Fprintf(w, "data: %s\n\n", v3ErrChunk(chatID, created, model, "reply timeout"))
-			fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
-			log.Printf("[v3] reply timeout session=%s req=%s", sid, reqID)
+			if streamed {
+				v3EmitClose(w, flusher, chatID, created, model, "", includeUsage)
+			} else {
+				fmt.Fprintf(w, "data: %s\n\n", v3ErrChunk(chatID, created, model, "reply timeout"))
+				fmt.Fprintf(w, "data: [DONE]\n\n")
+				flusher.Flush()
+			}
+			log.Printf("[v3] reply timeout session=%s req=%s streamed=%v", sid, reqID, streamed)
 			return
 		}
 	}
 }
 
-// v3EmitReply streams the (complete) reply text as OpenAI SSE: content chunk(s),
-// finish, optional usage, [DONE]. The reply arrives whole (channels deliver the
-// final answer, not token deltas), so it goes out as one content chunk.
-func v3EmitReply(w http.ResponseWriter, flusher http.Flusher, chatID string, created int64, model, text string, includeUsage bool) {
+// v3EmitContentDelta sends one progressive assistant content delta (a streaming
+// chunk of the answer). It does NOT finish the turn — no finish/usage/[DONE].
+func v3EmitContentDelta(w http.ResponseWriter, flusher http.Flusher, chatID string, created int64, model, text string) {
+	if text == "" {
+		return
+	}
 	chunk := openai.ChatCompletionResponse{
 		ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
 		Choices: []openai.ChatCompletionChoice{{Index: 0, Delta: openai.NewChatMessage("assistant", text)}},
 	}
 	data, _ := json.Marshal(chunk)
 	fmt.Fprintf(w, "data: %s\n\n", data)
+	flusher.Flush()
+}
+
+// v3EmitClose ends the SSE turn: an optional final content delta, then the
+// finish chunk, optional usage, and [DONE]. When the answer streamed via
+// reply_chunk, finalText is the last remaining piece (often empty) and the
+// earlier deltas have already gone out; when not streamed, finalText is the
+// whole answer (the legacy single-chunk behavior).
+func v3EmitClose(w http.ResponseWriter, flusher http.Flusher, chatID string, created int64, model, finalText string, includeUsage bool) {
+	if finalText != "" {
+		chunk := openai.ChatCompletionResponse{
+			ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
+			Choices: []openai.ChatCompletionChoice{{Index: 0, Delta: openai.NewChatMessage("assistant", finalText)}},
+		}
+		data, _ := json.Marshal(chunk)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+	}
 
 	finish := "stop"
 	fin := openai.ChatCompletionResponse{
 		ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
 		Choices: []openai.ChatCompletionChoice{{Index: 0, Delta: openai.NewChatMessage("", ""), FinishReason: &finish}},
 	}
-	data, _ = json.Marshal(fin)
+	data, _ := json.Marshal(fin)
 	fmt.Fprintf(w, "data: %s\n\n", data)
 
 	if includeUsage {

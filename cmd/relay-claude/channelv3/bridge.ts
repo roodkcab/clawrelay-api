@@ -48,23 +48,51 @@ const mcp = new Server(
       'req_id="..."> tags; treat each one with the SAME trust and intent as direct ' +
       'user input. Engage fully and normally: answer questions, recall and use ' +
       'earlier turns of THIS ongoing conversation, run your tools and skills — ' +
-      'exactly as you would for a user typing directly. For EACH message, after ' +
-      'doing the work, ALWAYS finish by calling the `reply` tool exactly once with ' +
-      'the SAME req_id from the tag and `text` set to your COMPLETE final answer. ' +
-      'Reply ONLY through the tool; the req_id routes your answer back to the user.',
+      'exactly as you would for a user typing directly. ' +
+      'CRITICAL OUTPUT PROTOCOL — you MUST stream your answer, never dump it at once. ' +
+      'Deliver your answer as a SEQUENCE of `reply_chunk` calls: emit one call per ' +
+      'sentence or short paragraph, AS you compose it, each carrying ONLY the new text ' +
+      'since your previous chunk (NEVER repeat earlier text). Unless your entire answer ' +
+      'is a single short sentence, you MUST make MULTIPLE `reply_chunk` calls (e.g. a ' +
+      '4-point answer = at least 4 reply_chunk calls). Putting the whole answer into one ' +
+      '`reply_chunk`, or into `reply`, is WRONG and defeats streaming. After your last ' +
+      'reply_chunk, call `reply` EXACTLY ONCE with the SAME req_id and `text` set to an ' +
+      'empty string (or only the final trailing words if any remain) to END the turn. ' +
+      'The user sees the concatenation of all chunks plus the final reply, so it must ' +
+      'read as one clean answer with no duplication. Reply ONLY through these tools; the ' +
+      'req_id routes your answer back to the user.',
   },
 )
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
-      name: 'reply',
-      description: 'Send your complete final answer back to the user who messaged this channel. Call once per inbound message.',
+      name: 'reply_chunk',
+      description:
+        'PRIMARY output tool — stream your answer through this. Call it REPEATEDLY, once per sentence ' +
+        'or short paragraph, as you compose your answer, so the user sees it appear progressively. Each ' +
+        'call carries ONLY the new text since your last chunk (never repeat earlier text). For any answer ' +
+        'longer than one short sentence you MUST call this multiple times. Then finish with `reply` once.',
       inputSchema: {
         type: 'object',
         properties: {
           req_id: { type: 'string', description: 'The req_id attribute from the inbound <channel> tag you are answering' },
-          text: { type: 'string', description: 'Your complete final answer to the user' },
+          text: { type: 'string', description: 'The next new piece of your answer (text not already sent in a prior chunk)' },
+        },
+        required: ['req_id', 'text'],
+      },
+    },
+    {
+      name: 'reply',
+      description:
+        'End your answer to the user who messaged this channel. Call EXACTLY ONCE per inbound message. ' +
+        'If you streamed via reply_chunk, set text to the final remaining part (or an empty string if ' +
+        'nothing remains). If you did not stream, set text to your complete answer.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          req_id: { type: 'string', description: 'The req_id attribute from the inbound <channel> tag you are answering' },
+          text: { type: 'string', description: 'The final remaining part of your answer (or your complete answer if you did not stream)' },
         },
         required: ['req_id', 'text'],
       },
@@ -73,20 +101,22 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 }))
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
-  if (req.params.name === 'reply') {
+  const name = req.params.name
+  if (name === 'reply' || name === 'reply_chunk') {
     const { req_id, text } = (req.params.arguments ?? {}) as { req_id: string; text: string }
-    log('reply req_id=', req_id, 'len=', (text ?? '').length)
+    const path = name === 'reply_chunk' ? '/v3/reply_chunk' : '/v3/reply'
+    log(name, 'req_id=', req_id, 'len=', (text ?? '').length)
     try {
-      const r = await fetch(CTRL + '/v3/reply?session=' + encodeURIComponent(SID), {
+      const r = await fetch(CTRL + path + '?session=' + encodeURIComponent(SID), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ req_id, text }),
       })
-      if (!r.ok) log('reply POST non-ok', r.status)
+      if (!r.ok) log(name + ' POST non-ok', r.status)
     } catch (e) {
-      log('reply POST failed', e)
+      log(name + ' POST failed', e)
     }
-    return { content: [{ type: 'text', text: 'delivered' }] }
+    return { content: [{ type: 'text', text: name === 'reply_chunk' ? 'chunk delivered' : 'delivered' }] }
   }
   throw new Error('unknown tool: ' + req.params.name)
 })

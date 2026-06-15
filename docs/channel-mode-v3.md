@@ -36,7 +36,7 @@ wuji_tools → relay :50008 (OpenAI HTTP/SSE，不变)
 | 能力 | V2 (stream-json) | V3 (channels) |
 |------|------------------|---------------|
 | 订阅计费 | ❌（被限制） | ✅ |
-| 逐 token 流式 | ✅ | ❌ reply 工具一次性给**完整回复** |
+| 逐 token 流式 | ✅ | ❌ 无 token 级；但支持**段级渐进式流式**（`reply_chunk`，见 §5） |
 | thinking 实时展示 | ✅ | ❌ |
 | 每轮 token 用量 | ✅ | ❌（channels 不透出） |
 | AskUserQuestion 卡片 | ✅ | ❌（交互 TUI，不经 channel） |
@@ -54,3 +54,12 @@ wuji_tools → relay :50008 (OpenAI HTTP/SSE，不变)
 - `--idle-ttl` / `--max-sessions`：交互式 claude 进程较重，按内存设保守上限。
 - `/channels` 暴露 v3 会话；`V3_DEBUG_PTY=1` 把每会话 TUI 落到 `/tmp/v3pty-<sid>.log`。
 - bridge 会在每个 bot working_dir 写 `.mcp.json`（合并保留既有 server）——会出现在 bot 仓库 git status，按需 .gitignore。
+
+## 5. 段级渐进式流式（reply_chunk，2026-06-15）
+
+V3 做不到"真·逐 token"流式：交互 TUI 无结构化输出口，token 增量被 `claude --help` 明确绑死在 `--print` + `--output-format=stream-json`，而那是非交互、丢订阅计费的路。折中：bridge 增设 `reply_chunk` 工具，claude 边写边按句/段多次调用，relay 每收到一段就 flush 一个 OpenAI SSE delta；最后 `reply` 空串收尾。**对外 OpenAI SSE 接口不变**（就是变成多个 content delta，和 V2 token 流式同一条消费路径）。
+
+- **协议**：`POST /v3/reply_chunk?session=<sid> {req_id,text}`（非终态 delta）+ `POST /v3/reply`（终态，结束 turn）。waiter 从 `chan string` 改为 `chan v3ReplyEvent{text,final}`；buffered `ch` **永不 close**，sender 在 `deliver()` 里用 `done` 兜底（沿用 V2 防 send-on-closed 不变量）。
+- **效果**（claude01 实测，opus）：4 点结构化答案 → 4 段流式，首字 23.7s → **14.7s**；暖 session follow-up 首字 **4.6s**、3 段；短答案不过度切分（1 段）。bridge 日志可见 `N×reply_chunk + 1×reply(len=0)`。
+- **取舍**：段级 ≠ token 级；每段一次工具往返，**总时长略增**；**强依赖 bridge `instructions` 的强制措辞**——弱措辞下 opus 完全不分段（实测一次性 `reply`）。设计了**优雅降级**：不配合时退回单段（= 原 V3 整段行为），永不出错。
+- **关键坑**：channel server 的 `instructions` 必须强制口吻（"MUST stream / 多点答案=多次 reply_chunk / 单段是错的"），否则 opus 默认一次性 `reply`，`reply_chunk` 形同虚设。
