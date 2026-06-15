@@ -127,6 +127,29 @@ const TOOL_PATHS: Record<string, string> = {
   progress: '/v3/progress',
 }
 
+// Strict injection serialization: pumpInbound injects ONE message, then waits
+// until claude calls `reply` for it before pulling the next. Two messages must
+// never sit in the single interactive session at once — that confuses and can
+// HANG claude (observed: a rapid 2nd message stalls both turns for ~20min).
+const replyWaiters = new Map<string, () => void>()
+function signalReplyDone(reqId: string) {
+  const w = replyWaiters.get(reqId)
+  if (w) w()
+}
+function waitForReplyDone(reqId: string, timeoutMs: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let settled = false
+    const fin = () => {
+      if (settled) return
+      settled = true
+      replyWaiters.delete(reqId)
+      resolve()
+    }
+    replyWaiters.set(reqId, fin)
+    setTimeout(fin, timeoutMs) // fallback: never block the pump forever
+  })
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const name = req.params.name
   const path = TOOL_PATHS[name]
@@ -143,6 +166,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     } catch (e) {
       log(name + ' POST failed', e)
     }
+    // A terminal reply means claude finished this message — release pumpInbound
+    // to inject the next queued message (strict one-at-a-time serialization).
+    if (name === 'reply') signalReplyDone(req_id)
     return { content: [{ type: 'text', text: name === 'reply' ? 'delivered' : 'ok' }] }
   }
   throw new Error('unknown tool: ' + req.params.name)
@@ -180,6 +206,11 @@ async function pumpInbound() {
         params: { content: msg.content, meta: { req_id: String(msg.req_id) } },
       })
       log('injected req_id=' + msg.req_id)
+      // Serialize: wait until claude finishes THIS message (calls `reply`) before
+      // pulling the next, so the single TUI never holds two messages at once.
+      // 20min fallback matches the relay's idle-timeout (never block forever).
+      await waitForReplyDone(String(msg.req_id), 20 * 60_000)
+      log('done req_id=' + msg.req_id + '; ready for next')
     } catch (e: any) {
       if (e?.name === 'TimeoutError') continue
       log('inbound loop error ' + (e?.message ?? String(e)))
