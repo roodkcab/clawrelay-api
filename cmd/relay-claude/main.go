@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -13,15 +14,17 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"clawrelay-api/pkg/openai"
 	"clawrelay-api/pkg/sessions"
 )
 
-var version = "1.1.4"
+var version = "2.0.0"
 
 var defaultModel = "vllm/claude-sonnet-4-6"
 
@@ -51,11 +54,27 @@ var allowedOrigins = []string{
 	"https://goofish-stat.52ritao.cn",
 }
 
-// Process-wide singletons. Both are created in main() and read from handlers.
+// Process-wide singletons. Created in main() and read from handlers.
 var (
 	sessionStore *sessions.Store
 	stats        = openai.NewStats()
+
+	// relayMode is "legacy" (per-request `claude -p`), "channel" (persistent
+	// stream-json process per session_id), or "channelv3" (interactive,
+	// subscription-billed claude driven via Claude Code "channels"). Only the
+	// matching manager is non-nil.
+	relayMode  = "legacy"
+	channelMgr *chanManager
+	v3Mgr      *v3Manager
 )
+
+// isChannelEligible reports whether a request matches the shape the channel
+// mechanism serves: streaming and tool-less. A present session_id reuses a
+// persistent process; an absent one runs ephemerally (fresh process per
+// request). Non-stream or tool-bearing requests fall through to legacy.
+func isChannelEligible(req *openai.ChatCompletionRequest) bool {
+	return req.Stream && len(req.Tools) == 0
+}
 
 func resolveModel(model string) string {
 	if idx := strings.LastIndex(model, "/"); idx >= 0 {
@@ -105,6 +124,43 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		model = defaultModel
 	}
 
+	includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+	hasTools := len(req.Tools) > 0
+
+	// Channel mode: serve every streaming, tool-less request through the
+	// stream-json mechanism (never the legacy `claude -p` path). Requests with a
+	// session_id reuse a persistent process keyed by session_id; requests
+	// without one (e.g. stateless cron tasks) get a fresh, throwaway process
+	// that runs once and is killed. Non-stream or tool-bearing shapes still fall
+	// through to the legacy path (the channel mechanism only models streaming,
+	// tool-less turns; wuji_tools never sends those shapes anyway).
+	if relayMode == "channelv3" && isChannelEligible(&req) {
+		log.Printf("ChatCompletion request [channelv3]: model=%s session=%s messages=%d", model, req.SessionID, len(req.Messages))
+		sessionStore.LogRequest(req.SessionID, &req)
+		handleChannelV3Response(w, r, &req, model, includeUsage)
+		return
+	}
+
+	if relayMode == "channel" && isChannelEligible(&req) {
+		if req.SessionID != "" {
+			log.Printf("ChatCompletion request [channel]: model=%s session=%s messages=%d", model, req.SessionID, len(req.Messages))
+			sessionStore.LogRequest(req.SessionID, &req)
+			handleChannelStreamResponse(w, r, &req, model, includeUsage)
+		} else {
+			log.Printf("ChatCompletion request [channel/ephemeral]: model=%s (no session) messages=%d", model, len(req.Messages))
+			handleChannelEphemeralStreamResponse(w, r, &req, model, includeUsage)
+		}
+		return
+	}
+
+	// Falling through to legacy in channel mode with a session_id (a non-stream
+	// or tool-bearing request): a live channel worker may be holding that
+	// session's jsonl open. Drop it first so the legacy `claude --resume` below
+	// can't write the same session concurrently.
+	if relayMode == "channel" && channelMgr != nil && req.SessionID != "" {
+		channelMgr.drop(req.SessionID)
+	}
+
 	var sessionDir string
 	if req.SessionID != "" {
 		sessionDir = filepath.Join(sessionStore.AbsDir(), req.SessionID, "files")
@@ -118,7 +174,6 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	hasTools := len(req.Tools) > 0
 	if hasTools {
 		systemPrompt += buildToolPrompt(req.Tools)
 		log.Printf("Injected %d tool definitions into system prompt", len(req.Tools))
@@ -133,8 +188,6 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	args, stdinData := buildClaudeArgs(&req, model, prompt, systemPrompt)
 
 	log.Printf("Claude args: %v (stdin length: %d bytes)", args, len(stdinData))
-
-	includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
 
 	workingDir := req.WorkingDir
 	envVars := req.EnvVars
@@ -174,7 +227,26 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		"status":  "healthy",
 		"backend": "claude",
 		"version": version,
+		"mode":    relayMode,
 	})
+}
+
+// channelsHandler exposes the live channel-worker registry for debugging and
+// for verifying process reuse (each session_id should show a single worker
+// across multiple turns). Empty in legacy mode.
+func channelsHandler(w http.ResponseWriter, r *http.Request) {
+	openai.SetCORSHeaders(w, r, allowedOrigins)
+	w.Header().Set("Content-Type", "application/json")
+	resp := map[string]any{"mode": relayMode}
+	switch {
+	case channelMgr != nil:
+		resp["workers"] = channelMgr.snapshot()
+	case v3Mgr != nil:
+		resp["workers"] = v3Mgr.snapshot()
+	default:
+		resp["workers"] = []any{}
+	}
+	json.NewEncoder(w).Encode(resp)
 }
 
 func statsHandler(w http.ResponseWriter, r *http.Request) {
@@ -193,6 +265,10 @@ func main() {
 	model := flag.String("model", "", "default model name (e.g. claude-sonnet-4-6)")
 	sessionsDir := flag.String("sessions-dir", "sessions", "directory for session log files + attachments")
 	logFilePath := flag.String("log-file", "relay-claude.log", "log file path (use - for stdout only)")
+	mode := flag.String("mode", "legacy", "legacy=per-request `claude -p`; channel=persistent stream-json process; channelv3=interactive claude via channels (subscription billing)")
+	idleTTL := flag.Duration("idle-ttl", 30*time.Minute, "channel/channelv3 mode: kill a session's process after this much idle time")
+	maxChannels := flag.Int("max-channels", 50, "channel/channelv3 mode: max concurrent processes (oldest evicted past this)")
+	v3BridgeDir := flag.String("v3-bridge-dir", "/data/relay-v3/bridge", "channelv3 mode: dir with bridge.ts + node_modules")
 	showVersion := flag.Bool("version", false, "show version and exit")
 	flag.Parse()
 
@@ -226,11 +302,61 @@ func main() {
 	sessionStore = sessions.New(*sessionsDir)
 	sessionStore.StartCleanup(72*time.Hour, 1*time.Hour)
 
+	relayMode = *mode
+	if relayMode == "channel" {
+		channelMgr = newChanManager(chanManagerConfig{
+			IdleTTL:     *idleTTL,
+			MaxChannels: *maxChannels,
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		channelMgr.StartReaper(ctx)
+		log.Printf("Channel mode ENABLED: idle-ttl=%s max-channels=%d", *idleTTL, *maxChannels)
+
+		// Graceful shutdown: kill every persistent worker process group so no
+		// orphaned `claude` child is left blocked on stdin after the relay
+		// exits (legacy per-request children self-terminate, channel ones do
+		// not). SIGTERM is what the restart SOP's `kill` sends.
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			s := <-sigCh
+			log.Printf("Received %s: killing %d channel worker(s) before exit", s, len(channelMgr.snapshot()))
+			channelMgr.Stop()
+			os.Exit(0)
+		}()
+	} else if relayMode == "channelv3" {
+		v3Mgr = newV3Manager(v3Config{
+			BridgeDir:   *v3BridgeDir,
+			IdleTTL:     *idleTTL,
+			MaxSessions: *maxChannels,
+		})
+		if err := v3Mgr.startControlServer(); err != nil {
+			log.Fatalf("v3 control server: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		v3Mgr.StartReaper(ctx)
+		log.Printf("Channel V3 mode ENABLED (interactive/subscription): bridge-dir=%s idle-ttl=%s max-sessions=%d ctrl=%s",
+			*v3BridgeDir, *idleTTL, *maxChannels, v3Mgr.ctrlURL)
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			s := <-sigCh
+			log.Printf("Received %s: killing %d interactive claude session(s) before exit", s, len(v3Mgr.snapshot()))
+			v3Mgr.Stop()
+			os.Exit(0)
+		}()
+	} else {
+		log.Printf("Legacy mode (per-request claude -p)")
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", chatCompletionsHandler)
 	mux.HandleFunc("/v1/models", modelsHandler)
 	mux.HandleFunc("/v1/stats", statsHandler)
 	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/channels", channelsHandler)
 	mux.HandleFunc("/sessions", sessionStore.ListHandler())
 	mux.HandleFunc("/session/", sessionStore.PageHandler())
 
