@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -105,6 +106,52 @@ func TestBuildCodexInputNoSystemMessages(t *testing.T) {
 	in := buildCodexInput(req, "codex/gpt-5.4", "", "")
 	if strings.Contains(in.Stdin, "system_rules") {
 		t.Fatalf("expected no system_rules block when no system message; got: %s", in.Stdin)
+	}
+}
+
+// TestResolveCodexUploadDir locks in the fix for the codex file-permission bug:
+// codex refuses to read attachments outside its working dir, so when a
+// working_dir is supplied uploads must be staged INSIDE it. With no working_dir
+// we fall back to the relay's own sessions tree, and with no session there is no
+// stable dir (ephemeral /tmp staging in attachments.ExtractAndSave).
+func TestResolveCodexUploadDir(t *testing.T) {
+	tests := []struct {
+		name           string
+		workingDir     string
+		sessionsAbsDir string
+		sessionID      string
+		want           string
+	}{
+		{
+			name:           "working dir present stages inside cwd",
+			workingDir:     "/data/skills/testa",
+			sessionsAbsDir: "/home/claude10/sessions",
+			sessionID:      "sess-1",
+			want:           filepath.Join("/data/skills/testa", ".relay_uploads", "sess-1"),
+		},
+		{
+			name:           "no working dir falls back to sessions tree",
+			workingDir:     "",
+			sessionsAbsDir: "/home/claude10/sessions",
+			sessionID:      "sess-1",
+			want:           filepath.Join("/home/claude10/sessions", "sess-1", "files"),
+		},
+		{
+			name:           "no session id means ephemeral tmp staging",
+			workingDir:     "/data/skills/testa",
+			sessionsAbsDir: "/home/claude10/sessions",
+			sessionID:      "",
+			want:           "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveCodexUploadDir(tt.workingDir, tt.sessionsAbsDir, tt.sessionID)
+			if got != tt.want {
+				t.Fatalf("resolveCodexUploadDir(%q,%q,%q) = %q, want %q",
+					tt.workingDir, tt.sessionsAbsDir, tt.sessionID, got, tt.want)
+			}
+		})
 	}
 }
 
