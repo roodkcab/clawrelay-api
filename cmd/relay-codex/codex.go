@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -13,6 +14,25 @@ import (
 	"clawrelay-api/pkg/openai"
 	"clawrelay-api/pkg/proc"
 )
+
+// resolveCodexUploadDir decides where decoded attachments for a codex turn are
+// written. Unlike claude (which runs with --permission-mode bypassPermissions
+// and will read any absolute path), codex refuses to touch files outside its
+// working dir even under --dangerously-bypass-approvals-and-sandbox. So when the
+// caller supplies a working_dir we stage uploads INSIDE it, under a git-ignored
+// .relay_uploads/<session> subdir where codex can read them. With no working_dir
+// we fall back to the relay's own sessions tree (the legacy behavior). Returns
+// "" when there is no session — attachments.ExtractAndSave then uses a fresh
+// /tmp file the caller is expected to clean up.
+func resolveCodexUploadDir(workingDir, sessionsAbsDir, sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	if workingDir != "" {
+		return filepath.Join(workingDir, ".relay_uploads", sessionID)
+	}
+	return filepath.Join(sessionsAbsDir, sessionID, "files")
+}
 
 // cleanEnv mirrors the Claude relay's helper but strips CODEX_* job-control
 // vars so a relay running inside another codex session doesn't confuse the

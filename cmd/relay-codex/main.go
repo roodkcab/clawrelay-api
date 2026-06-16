@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -30,7 +31,7 @@ import (
 	"clawrelay-api/pkg/sessions"
 )
 
-var version = "1.1.4"
+var version = "1.1.5"
 
 var defaultModel = "codex/gpt-5.5"
 
@@ -100,10 +101,19 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			"codex uses its own native tool harness (shell, file edits, web_search, etc.)", len(req.Tools))
 	}
 
-	// Per-session attachment + thread-binding directory.
-	var sessionDir string
-	if req.SessionID != "" {
-		sessionDir = sessionStore.AbsDir() + "/" + req.SessionID + "/files"
+	// Per-session attachment directory. Codex (unlike claude's bypassPermissions)
+	// won't read files outside its working dir, so uploads must be staged INSIDE
+	// it — see resolveCodexUploadDir. We git-ignore the staging root so the bot's
+	// working-dir git status stays clean, and remove this turn's files when the
+	// request finishes (codex resume only resends the latest message, so no
+	// cross-turn dedup is lost).
+	sessionDir := resolveCodexUploadDir(req.WorkingDir, sessionStore.AbsDir(), req.SessionID)
+	if sessionDir != "" && req.WorkingDir != "" {
+		uploadsRoot := filepath.Join(req.WorkingDir, ".relay_uploads")
+		if err := os.MkdirAll(uploadsRoot, 0755); err == nil {
+			_ = os.WriteFile(filepath.Join(uploadsRoot, ".gitignore"), []byte("*\n"), 0644)
+		}
+		defer os.RemoveAll(sessionDir)
 	}
 
 	// Look up an existing codex thread for this client session — this is the
