@@ -9,10 +9,10 @@
 
 > **不带 `--print`**：relay 用管道捕获子进程 stdout（非 TTY），claude 据此自动进入 non-interactive/headless 模式（`claude --help`：「via -p, **or when stdout is not a TTY**」），stream-json 输入/输出无需显式 `--print` 即生效。已实测多轮 + interrupt 行为与带 `--print` 完全一致。
 
-通过启动参数 `--mode=channel` 开启；`--mode=legacy`（默认）行为与改动前**字节级一致，零回归**。对上游 wuji_tools 的 OpenAI HTTP/SSE 协议**零改动**。
+通过启动参数 `--mode=channel` 开启；V1（旧称 legacy，`-p`/headless 每请求 fork `claude -p`；启动标志为 `--mode=v1`（默认）/默认裸 `--port=`，旧值 `--mode=legacy` 仍作别名兼容，`/health` 返回 `"mode":"v1"`）行为与改动前**字节级一致，零回归**。对上游 wuji_tools 的 OpenAI HTTP/SSE 协议**零改动**。
 
 ```
---mode=legacy   (默认)  每请求 fork 一次 `claude -p`，出完即退（现状）
+--mode=v1       (默认)  每请求 fork 一次 `claude -p`，出完即退（现状；旧值 legacy 仍兼容）
 --mode=channel          每 session_id 一个常驻 stream-json 进程，多轮复用
 ```
 
@@ -20,7 +20,7 @@
 
 | flag | 默认 | 说明 |
 |------|------|------|
-| `--mode` | `legacy` | `legacy` / `channel` |
+| `--mode` | `v1` | `v1`（别名 `legacy`）/ `channel` |
 | `--idle-ttl` | `30m` | channel：进程空闲超过此时长被回收 |
 | `--max-channels` | `50` | channel：最大常驻进程数，超出 evict 最旧 |
 
@@ -37,22 +37,22 @@ channel 模式下，**所有 `stream=true` 且无 `tools` 的请求都走 stream
 |----------|------|
 | `stream` + 有 `session_id` + 无 `tools` | **持久化 channel**：按 session_id 复用常驻进程（多轮省 spawn） |
 | `stream` + 无 `session_id` + 无 `tools`（如无状态 cron） | **ephemeral channel**：全新 UUID 起独立进程，喂完整对话，跑完即 kill（见 §3.1） |
-| 非流式 / 带 `tools` | legacy（`handleNonStreamResponse` / `handleBufferedStreamResponse`，这些形态 wuji_tools 不会发） |
+| 非流式 / 带 `tools` | V1（`handleNonStreamResponse` / `handleBufferedStreamResponse`，这些形态 wuji_tools 不会发） |
 
 判定见 `isChannelEligible()`（`stream && 无 tools`）+ dispatch 按 `session_id` 有无分流（`cmd/relay-claude/main.go`）。
 
 ### 3.1 Ephemeral（无 session_id）独立运行
 
-无 session_id 的请求每次都是一次**独立运行**：mint 一个全新 UUID → spawn 一个 `--input-format stream-json` 进程 → 用 `buildPromptFromMessages` 把整段对话扁平化后喂入（与 legacy 收到的内容**完全一致**）→ 流式翻译返回 → 本轮 `result` 后 **kill 进程**。不复用、不入池，独立请求间上下文不串台。
+无 session_id 的请求每次都是一次**独立运行**：mint 一个全新 UUID → spawn 一个 `--input-format stream-json` 进程 → 用 `buildPromptFromMessages` 把整段对话扁平化后喂入（与 V1 收到的内容**完全一致**）→ 流式翻译返回 → 本轮 `result` 后 **kill 进程**。不复用、不入池，独立请求间上下文不串台。
 
-> claude 在同一 cwd 下有跨 session 的 memory 行为；ephemeral 与 legacy 在这点上表现一致（非回归）。
+> claude 在同一 cwd 下有跨 session 的 memory 行为；ephemeral 与 V1 在这点上表现一致（非回归）。
 > ephemeral 进程在运行期间登记在 manager 的 `inflight` 集合里（供 SIGTERM 优雅关闭与 `/channels` 可见），跑完即注销并 kill。
 
 ## 4. 架构
 
 | 文件 | 作用 |
 |------|------|
-| `translate.go` | `sseTranslator`：stream-json 事件 → OpenAI SSE chunk 翻译（legacy 与 channel **共用**，等价重构） |
+| `translate.go` | `sseTranslator`：stream-json 事件 → OpenAI SSE chunk 翻译（V1 与 channel **共用**，等价重构） |
 | `channel.go` | `chanWorker`（常驻进程，单 stdout reader 按 `result` 事件切 turn 边界，`turnMu` 串行化同 session 请求）+ `chanManager`（key=session_id、idle reaper、容量 evict、`--session-id`/`--resume` 双向 spawn 重试） |
 | `channel_handler.go` | 单 turn 的 SSE 循环；stop / AskUserQuestion 的中断处理 |
 | `main.go` | `--mode` 等 flag、dispatch 分流、`/channels` 端点、SIGTERM 优雅关闭 |
@@ -77,10 +77,10 @@ channel 模式下，**所有 `stream=true` 且无 `tools` 的请求都走 stream
 
 ## 6. 可观测与运维
 
-- **`GET /health`** → `{"mode":"channel"|"legacy", ...}`，可确认当前模式。
+- **`GET /health`** → `{"mode":"channel"|"v1", ...}`，可确认当前模式。
 - **`GET /channels`** → 当前常驻 worker 列表（session_id、claude_sid、flag、last_used、dead），用于验证进程复用。
 - 日志标注：`[channel] spawned/turn start/turn end/interrupt/reaping/capacity evict`。
-- **SIGTERM 优雅关闭**：收到 SIGTERM/SIGINT 先 KillGroup 全部 worker 再退出，杜绝常驻 claude 子进程孤儿泄漏（legacy 的每请求子进程会自行退出，channel 的不会）。重启用的 `kill` 即发 SIGTERM。
+- **SIGTERM 优雅关闭**：收到 SIGTERM/SIGINT 先 KillGroup 全部 worker 再退出，杜绝常驻 claude 子进程孤儿泄漏（V1 的每请求子进程会自行退出，channel 的不会）。重启用的 `kill` 即发 SIGTERM。
 
 ## 7. 二进制升级注意（chroot 实例）
 
@@ -91,9 +91,9 @@ channel 模式下，**所有 `stream=true` 且无 `tools` 的请求都走 stream
    sudo cp <new> /usr/local/bin/.cooa.new
    sudo mv -f /usr/local/bin/.cooa.new /usr/local/bin/claude_openai_api
    ```
-3. 改它会影响 claude01–06 下次重启（legacy 字节等价，安全）。
+3. 改它会影响 claude01–06 下次重启（V1 字节等价，安全）。
 
-**回滚**：50008 重启时去掉 `--mode=channel` 即回 legacy（v1.2.0 legacy == v1.1.4 legacy），或恢复备份 `claude_openai_api.bak.v1.1.4`。
+**回滚**：50008 重启时去掉 `--mode=channel` 即回 V1（v1.2.0 V1 == v1.1.4 V1），或恢复备份 `claude_openai_api.bak.v1.1.4`。
 
 ## 8. 上线状态与实测（2026-06-15）
 
@@ -102,10 +102,10 @@ channel 模式下，**所有 `stream=true` 且无 `tools` 的请求都走 stream
 
   | | turn1 冷启动 | turn2 |
   |---|---|---|
-  | legacy | 19.2s | 4.96s（每轮重 spawn） |
+  | V1 | 19.2s | 4.96s（每轮重 spawn） |
   | channel | 22.3s | **1.76s（复用，省 ~20.5s）** |
 
-- legacy 真实 opus 流量零回归（token 统计完整）；本地 race + 单测 + 端到端集成全绿。
+- V1 真实 opus 流量零回归（token 统计完整）；本地 race + 单测 + 端到端集成全绿。
 - 三轮对抗式审查共修 11 个并发/正确性问题（含 1 个会导致 relay 整体崩溃的 send-on-closed 竞争），最终审查 CLEAN。详见 §9。
 - 上线后真实 opus 多轮会话已观测到 channel 复用（同 session 跨多轮复用同一进程），无 panic、内存稳定。
 
