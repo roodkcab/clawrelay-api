@@ -928,15 +928,9 @@ func v3EmitClose(w http.ResponseWriter, flusher http.Flusher, chatID string, cre
 	data, _ := json.Marshal(fin)
 	fmt.Fprintf(w, "data: %s\n\n", data)
 
-	if includeUsage {
-		// Channels don't surface token counts; report zeros so the shape holds.
-		usage := openai.ChatCompletionResponse{
-			ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
-			Choices: []openai.ChatCompletionChoice{}, Usage: &openai.UsageInfo{},
-		}
-		data, _ = json.Marshal(usage)
-		fmt.Fprintf(w, "data: %s\n\n", data)
-	}
+	// V3 has no token source (interactive PTY, no stream-json). Emit NO usage
+	// chunk so downstream stores NULL ("not metered"), not 0 ("free request").
+	_ = includeUsage
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }
