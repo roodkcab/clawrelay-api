@@ -345,12 +345,13 @@ func handleChannelStreamResponse(w http.ResponseWriter, r *http.Request, req *op
 		go func() {
 			for {
 				select {
-				case _, ok := <-lines:
+				case ln, ok := <-lines:
 					if !ok {
 						timer.Stop()
 						worker.endTurn()
 						return
 					}
+					advanceMeterFromLine(worker.meter, ln)
 				case <-worker.deadCh:
 					// Process died; lines may never close. Stop waiting so the
 					// worker is released rather than leaking this goroutine.

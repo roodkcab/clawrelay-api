@@ -46,3 +46,24 @@ func TestCumulativeMeterResetsOnSourceShapeChange(t *testing.T) {
 		t.Fatalf("shape-change delta = %+v, want the cur snapshot", d)
 	}
 }
+
+func TestAdvanceMeterFromLineAbsorbsDroppedTurn(t *testing.T) {
+	m := &cumulativeMeter{}
+	// 一个被中断、未走 feed 的 turn：累计推进到 input=500。
+	advanceMeterFromLine(m, `{"type":"result","usage":{"input_tokens":500,"output_tokens":300,"cache_read_input_tokens":9000}}`)
+	// 下一前台 turn 的累计是 input=506，delta 应只含本轮增量，不含被丢轮的 500。
+	d := m.perTurn(usageSnapshot{input: 506, output: 340, cacheRead: 9500})
+	if d.input != 6 || d.output != 40 || d.cacheRead != 500 {
+		t.Fatalf("delta after background-drain advance = %+v, want {6,40,500}", d)
+	}
+}
+
+func TestAdvanceMeterFromLineIgnoresNonResult(t *testing.T) {
+	m := &cumulativeMeter{}
+	advanceMeterFromLine(m, `{"type":"stream_event"}`)
+	advanceMeterFromLine(m, `not json`)
+	d := m.perTurn(usageSnapshot{input: 100, output: 50})
+	if d.input != 100 {
+		t.Fatalf("baseline moved on non-result line: delta=%+v", d)
+	}
+}

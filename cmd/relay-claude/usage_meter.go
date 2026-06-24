@@ -1,6 +1,9 @@
 package main
 
-import "sync"
+import (
+	"encoding/json"
+	"sync"
+)
 
 // usageSnapshot is one turn's token + cost figures plus a shape tag. All fields
 // are comparable, so snapshots can be compared with ==.
@@ -64,4 +67,32 @@ func (m *cumulativeMeter) perTurn(cur usageSnapshot) usageSnapshot {
 
 	m.last = cur
 	return d
+}
+
+// advanceMeterFromLine parses a stream-json line and, if it is a result with
+// usage, advances a cumulativeMeter's baseline (discarding the per-turn delta).
+// Used by the background drainer of an interrupted turn so its cumulative usage
+// is absorbed into the baseline instead of bleeding into the next foreground
+// turn. No-op for non-cumulative meters.
+func advanceMeterFromLine(meter usageMeter, line string) {
+	cm, ok := meter.(*cumulativeMeter)
+	if !ok {
+		return
+	}
+	var event claudeEvent
+	if err := json.Unmarshal([]byte(line), &event); err != nil || event.Type != "result" {
+		return
+	}
+	eu := effectiveUsage(&event)
+	if eu == nil {
+		return
+	}
+	cm.perTurn(usageSnapshot{
+		input:          eu.InputTokens,
+		output:         eu.OutputTokens,
+		cacheCreation:  eu.CacheCreationInputTokens,
+		cacheRead:      eu.CacheReadInputTokens,
+		costUSD:        event.TotalCostUSD,
+		fromModelUsage: len(event.ModelUsage) > 0,
+	})
 }
