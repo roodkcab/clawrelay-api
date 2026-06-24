@@ -46,6 +46,7 @@ type sseTranslator struct {
 	created   int64
 	model     string
 	sessionID string
+	meter     usageMeter
 
 	streamDeltaSent bool
 	streamUsage     *openai.UsageInfo
@@ -62,12 +63,16 @@ type sseTranslator struct {
 	aggCount int
 }
 
-func newSSETranslator(chatID string, created int64, model, sessionID string) *sseTranslator {
+func newSSETranslator(chatID string, created int64, model, sessionID string, meter usageMeter) *sseTranslator {
+	if meter == nil {
+		meter = identityMeter{}
+	}
 	return &sseTranslator{
 		chatID:        chatID,
 		created:       created,
 		model:         model,
 		sessionID:     sessionID,
+		meter:         meter,
 		seenToolNames: map[string]bool{},
 		askUserIdx:    -1,
 		toolBlocks:    map[int]*toolBlock{},
@@ -270,13 +275,20 @@ func (t *sseTranslator) feed(w http.ResponseWriter, flusher http.Flusher, line s
 
 	if event.Type == "result" {
 		if eu := effectiveUsage(&event); eu != nil {
-			stats.Record(t.model, eu.InputTokens, eu.OutputTokens,
-				eu.CacheCreationInputTokens, eu.CacheReadInputTokens, event.TotalCostUSD)
-			log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f (subagents_included=%v)",
-				t.model, eu.InputTokens, eu.OutputTokens,
-				eu.CacheReadInputTokens, eu.CacheCreationInputTokens, event.TotalCostUSD,
-				len(event.ModelUsage) > 0)
-			t.streamUsage = openai.BuildUsageInfo(eu.InputTokens, eu.OutputTokens, eu.CacheReadInputTokens, eu.CacheCreationInputTokens)
+			cur := usageSnapshot{
+				input:          eu.InputTokens,
+				output:         eu.OutputTokens,
+				cacheCreation:  eu.CacheCreationInputTokens,
+				cacheRead:      eu.CacheReadInputTokens,
+				costUSD:        event.TotalCostUSD,
+				fromModelUsage: len(event.ModelUsage) > 0,
+			}
+			d := t.meter.perTurn(cur)
+			stats.Record(t.model, d.input, d.output, d.cacheCreation, d.cacheRead, d.costUSD)
+			log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f raw_input=%d raw_cache_read=%d (subagents=%v)",
+				t.model, d.input, d.output, d.cacheRead, d.cacheCreation, d.costUSD,
+				cur.input, cur.cacheRead, cur.fromModelUsage)
+			t.streamUsage = openai.BuildUsageInfo(d.input, d.output, d.cacheRead, d.cacheCreation)
 		}
 
 		finishReason := "stop"
@@ -287,7 +299,7 @@ func (t *sseTranslator) feed(w http.ResponseWriter, flusher http.Flusher, line s
 			},
 		})
 
-		if includeUsage && event.Usage != nil {
+		if includeUsage && t.streamUsage != nil {
 			t.emit(w, flusher, openai.ChatCompletionResponse{
 				ID: t.chatID, Object: "chat.completion.chunk", Created: t.created, Model: t.model,
 				Choices: []openai.ChatCompletionChoice{},

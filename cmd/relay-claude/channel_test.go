@@ -448,7 +448,7 @@ func TestNewUUID(t *testing.T) {
 func TestSSETranslatorTextAndResult(t *testing.T) {
 	sessionStore = sessions.New(t.TempDir())
 	rec := httptest.NewRecorder()
-	tr := newSSETranslator("chatcmpl-x", 1700000000, "haiku", "") // empty sessionID → log no-ops
+	tr := newSSETranslator("chatcmpl-x", 1700000000, "haiku", "", identityMeter{}) // empty sessionID → log no-ops
 
 	textLine := `{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}}`
 	resultLine := `{"type":"result","subtype":"success","usage":{"input_tokens":10,"output_tokens":5},"total_cost_usd":0.001}`
@@ -477,7 +477,7 @@ func TestSSETranslatorTextAndResult(t *testing.T) {
 func TestSSETranslatorAskUserQuestion(t *testing.T) {
 	sessionStore = sessions.New(t.TempDir())
 	rec := httptest.NewRecorder()
-	tr := newSSETranslator("chatcmpl-y", 1700000000, "haiku", "")
+	tr := newSSETranslator("chatcmpl-y", 1700000000, "haiku", "", identityMeter{})
 
 	start := `{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_1","name":"AskUserQuestion"}}}`
 	delta := `{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"questions\":[]}"}}}`
@@ -496,5 +496,43 @@ func TestSSETranslatorAskUserQuestion(t *testing.T) {
 	}
 	if !strings.Contains(body, `data: [DONE]`) {
 		t.Errorf("AskUserQuestion should terminate with [DONE]:\n%s", body)
+	}
+}
+
+// 同一 cumulativeMeter 跨两轮 feed：第二轮 emit 的是 delta，不是累计。
+func TestSSETranslatorChannelDiffsCumulativeUsage(t *testing.T) {
+	sessionStore = sessions.New(t.TempDir())
+	meter := &cumulativeMeter{}
+
+	rec1 := httptest.NewRecorder()
+	tr1 := newSSETranslator("c1", 1700000000, "haiku", "", meter)
+	tr1.feed(rec1, rec1, `{"type":"result","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":1000}}`, true)
+
+	rec2 := httptest.NewRecorder()
+	tr2 := newSSETranslator("c2", 1700000000, "haiku", "", meter)
+	tr2.feed(rec2, rec2, `{"type":"result","usage":{"input_tokens":106,"output_tokens":90,"cache_read_input_tokens":4500}}`, true)
+
+	u := tr2.StreamUsage()
+	if u == nil {
+		t.Fatal("turn 2 StreamUsage nil")
+	}
+	if u.CompletionTokens != 40 {
+		t.Fatalf("turn2 completion = %d, want 40 (per-turn delta, not cumulative 90)", u.CompletionTokens)
+	}
+	// promptTokens = input(6) + cacheRead(3500) = 3506
+	if u.PromptTokens != 3506 {
+		t.Fatalf("turn2 prompt = %d, want 3506 (delta 6 input + 3500 cacheRead)", u.PromptTokens)
+	}
+}
+
+// gating fix: modelUsage 在场、顶层 usage 缺失时，仍 emit usage chunk。
+func TestSSETranslatorEmitsUsageFromModelUsage(t *testing.T) {
+	sessionStore = sessions.New(t.TempDir())
+	rec := httptest.NewRecorder()
+	tr := newSSETranslator("c", 1700000000, "haiku", "", identityMeter{})
+	line := `{"type":"result","modelUsage":{"claude-haiku":{"inputTokens":10,"outputTokens":5,"cacheReadInputTokens":20}}}`
+	tr.feed(rec, rec, line, true)
+	if !strings.Contains(rec.Body.String(), `"prompt_tokens"`) {
+		t.Errorf("usage chunk missing when only modelUsage present (gating bug):\n%s", rec.Body.String())
 	}
 }

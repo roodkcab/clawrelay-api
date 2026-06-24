@@ -224,7 +224,7 @@ func handleChannelEphemeralStreamResponse(w http.ResponseWriter, r *http.Request
 	heartbeat := time.NewTicker(30 * time.Second)
 	defer heartbeat.Stop()
 
-	t := newSSETranslator(chatID, created, model, "") // no session → log no-ops
+	t := newSSETranslator(chatID, created, model, "", identityMeter{}) // no session → log no-ops
 	for {
 		select {
 		case <-r.Context().Done():
@@ -386,7 +386,7 @@ func handleChannelStreamResponse(w http.ResponseWriter, r *http.Request, req *op
 	heartbeat := time.NewTicker(30 * time.Second)
 	defer heartbeat.Stop()
 
-	t := newSSETranslator(chatID, created, model, sessionID)
+	t := newSSETranslator(chatID, created, model, sessionID, worker.meter)
 	ctxCh := r.Context().Done()
 
 	for {
