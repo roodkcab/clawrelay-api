@@ -49,7 +49,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 	heartbeatTicker := time.NewTicker(30 * time.Second)
 	defer heartbeatTicker.Stop()
 
-	t := newSSETranslator(chatID, created, model, sessionID)
+	t := newSSETranslator(chatID, created, model, sessionID, identityMeter{})
 
 processLines:
 	for {

@@ -77,6 +77,11 @@ type chanWorker struct {
 
 	curMu sync.Mutex
 	cur   *activeTurn // current turn's channels; nil between turns
+
+	// meter diffs this persistent process's cumulative result.usage into
+	// per-turn deltas. Its lifetime == the process's, so a respawned worker
+	// (new struct) starts from a zero baseline. See usage_meter.go.
+	meter *cumulativeMeter
 }
 
 // activeTurn bundles one turn's stdout-line channel with an abandon signal.
@@ -144,6 +149,7 @@ func spawnChanWorker(key string, args []string, workdir string, envVars map[stri
 		usedFlag:  usedFlag,
 		ready:     make(chan struct{}),
 		deadCh:    make(chan struct{}),
+		meter:     &cumulativeMeter{},
 	}
 	w.markUsed()
 

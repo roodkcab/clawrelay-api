@@ -224,7 +224,7 @@ func handleChannelEphemeralStreamResponse(w http.ResponseWriter, r *http.Request
 	heartbeat := time.NewTicker(30 * time.Second)
 	defer heartbeat.Stop()
 
-	t := newSSETranslator(chatID, created, model, "") // no session → log no-ops
+	t := newSSETranslator(chatID, created, model, "", identityMeter{}) // no session → log no-ops
 	for {
 		select {
 		case <-r.Context().Done():
@@ -345,12 +345,13 @@ func handleChannelStreamResponse(w http.ResponseWriter, r *http.Request, req *op
 		go func() {
 			for {
 				select {
-				case _, ok := <-lines:
+				case ln, ok := <-lines:
 					if !ok {
 						timer.Stop()
 						worker.endTurn()
 						return
 					}
+					advanceMeterFromLine(worker.meter, ln)
 				case <-worker.deadCh:
 					// Process died; lines may never close. Stop waiting so the
 					// worker is released rather than leaking this goroutine.
@@ -386,7 +387,7 @@ func handleChannelStreamResponse(w http.ResponseWriter, r *http.Request, req *op
 	heartbeat := time.NewTicker(30 * time.Second)
 	defer heartbeat.Stop()
 
-	t := newSSETranslator(chatID, created, model, sessionID)
+	t := newSSETranslator(chatID, created, model, sessionID, worker.meter)
 	ctxCh := r.Context().Done()
 
 	for {
