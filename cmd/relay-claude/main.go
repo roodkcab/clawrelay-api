@@ -24,7 +24,7 @@ import (
 	"clawrelay-api/pkg/sessions"
 )
 
-var version = "2.0.1"
+var version = "2.0.2"
 
 var defaultModel = "vllm/claude-sonnet-4-6"
 
