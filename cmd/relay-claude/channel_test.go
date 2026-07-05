@@ -448,7 +448,7 @@ func TestNewUUID(t *testing.T) {
 func TestSSETranslatorTextAndResult(t *testing.T) {
 	sessionStore = sessions.New(t.TempDir())
 	rec := httptest.NewRecorder()
-	tr := newSSETranslator("chatcmpl-x", 1700000000, "haiku", "", identityMeter{}) // empty sessionID → log no-ops
+	tr := newSSETranslator("chatcmpl-x", 1700000000, "haiku", "", identityMeter{}, "") // empty sessionID → log no-ops
 
 	textLine := `{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}}`
 	resultLine := `{"type":"result","subtype":"success","usage":{"input_tokens":10,"output_tokens":5},"total_cost_usd":0.001}`
@@ -477,7 +477,7 @@ func TestSSETranslatorTextAndResult(t *testing.T) {
 func TestSSETranslatorAskUserQuestion(t *testing.T) {
 	sessionStore = sessions.New(t.TempDir())
 	rec := httptest.NewRecorder()
-	tr := newSSETranslator("chatcmpl-y", 1700000000, "haiku", "", identityMeter{})
+	tr := newSSETranslator("chatcmpl-y", 1700000000, "haiku", "", identityMeter{}, "")
 
 	start := `{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_1","name":"AskUserQuestion"}}}`
 	delta := `{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"questions\":[]}"}}}`
@@ -500,17 +500,19 @@ func TestSSETranslatorAskUserQuestion(t *testing.T) {
 }
 
 // 同一 cumulativeMeter 跨两轮 feed：第二轮 emit 的是 delta，不是累计。
+// 用 modelUsage shape（进程级累计口径）驱动；bare usage 是 per-turn 值，
+// 不走差分（实证依据见 usage_meter.go 注释）。
 func TestSSETranslatorChannelDiffsCumulativeUsage(t *testing.T) {
 	sessionStore = sessions.New(t.TempDir())
 	meter := &cumulativeMeter{}
 
 	rec1 := httptest.NewRecorder()
-	tr1 := newSSETranslator("c1", 1700000000, "haiku", "", meter)
-	tr1.feed(rec1, rec1, `{"type":"result","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":1000}}`, true)
+	tr1 := newSSETranslator("c1", 1700000000, "haiku", "", meter, "")
+	tr1.feed(rec1, rec1, `{"type":"result","modelUsage":{"claude-haiku":{"inputTokens":100,"outputTokens":50,"cacheReadInputTokens":1000}}}`, true)
 
 	rec2 := httptest.NewRecorder()
-	tr2 := newSSETranslator("c2", 1700000000, "haiku", "", meter)
-	tr2.feed(rec2, rec2, `{"type":"result","usage":{"input_tokens":106,"output_tokens":90,"cache_read_input_tokens":4500}}`, true)
+	tr2 := newSSETranslator("c2", 1700000000, "haiku", "", meter, "")
+	tr2.feed(rec2, rec2, `{"type":"result","modelUsage":{"claude-haiku":{"inputTokens":106,"outputTokens":90,"cacheReadInputTokens":4500}}}`, true)
 
 	u := tr2.StreamUsage()
 	if u == nil {
@@ -529,10 +531,107 @@ func TestSSETranslatorChannelDiffsCumulativeUsage(t *testing.T) {
 func TestSSETranslatorEmitsUsageFromModelUsage(t *testing.T) {
 	sessionStore = sessions.New(t.TempDir())
 	rec := httptest.NewRecorder()
-	tr := newSSETranslator("c", 1700000000, "haiku", "", identityMeter{})
+	tr := newSSETranslator("c", 1700000000, "haiku", "", identityMeter{}, "")
 	line := `{"type":"result","modelUsage":{"claude-haiku":{"inputTokens":10,"outputTokens":5,"cacheReadInputTokens":20}}}`
 	tr.feed(rec, rec, line, true)
 	if !strings.Contains(rec.Body.String(), `"prompt_tokens"`) {
 		t.Errorf("usage chunk missing when only modelUsage present (gating bug):\n%s", rec.Body.String())
+	}
+}
+
+// A2: 进程无 result 就退出时，流必须补一个 finish chunk；正常轮 no-op。
+func TestEmitFinishIfNoResult(t *testing.T) {
+	sessionStore = sessions.New(t.TempDir())
+
+	// 没见过 result → 合成 finish chunk。
+	rec := httptest.NewRecorder()
+	tr := newSSETranslator("c-nofin", 1700000000, "haiku", "", identityMeter{}, "")
+	tr.feed(rec, rec, `{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}}`, true)
+	tr.EmitFinishIfNoResult(rec, rec)
+	if !strings.Contains(rec.Body.String(), `"finish_reason":"stop"`) {
+		t.Errorf("missing synthetic finish chunk when stream ended without result:\n%s", rec.Body.String())
+	}
+
+	// 正常轮（result 已 emit finish）→ no-op，不能出现第二个 finish chunk。
+	rec2 := httptest.NewRecorder()
+	tr2 := newSSETranslator("c-fin", 1700000000, "haiku", "", identityMeter{}, "")
+	tr2.feed(rec2, rec2, `{"type":"result","usage":{"input_tokens":1,"output_tokens":1}}`, false)
+	before := rec2.Body.Len()
+	tr2.EmitFinishIfNoResult(rec2, rec2)
+	if rec2.Body.Len() != before {
+		t.Errorf("EmitFinishIfNoResult must be a no-op after a result event:\n%s", rec2.Body.String())
+	}
+}
+
+// A5: cumulativeMeter 路径的 stats 归属跟 meterModel（worker 的 spawn-time
+// boundModel），而不是请求 model —— 热切模型后不再错归属。
+func TestSSETranslatorAttributesToMeterModel(t *testing.T) {
+	sessionStore = sessions.New(t.TempDir())
+	const boundModel = "test-meter-model-bound"
+	const reqModel = "test-meter-model-request"
+
+	rowTotal := func(model string) int64 {
+		row, ok := stats.Snapshot().PerModel[model]
+		if !ok {
+			return 0
+		}
+		return row.Total
+	}
+	boundBefore, reqBefore := rowTotal(boundModel), rowTotal(reqModel)
+
+	rec := httptest.NewRecorder()
+	tr := newSSETranslator("c-mm", 1700000000, reqModel, "", &cumulativeMeter{}, boundModel)
+	tr.feed(rec, rec, `{"type":"result","modelUsage":{"claude-x":{"inputTokens":11,"outputTokens":7}}}`, true)
+
+	if got := rowTotal(boundModel) - boundBefore; got != 18 {
+		t.Fatalf("boundModel stats delta = %d, want 18", got)
+	}
+	if got := rowTotal(reqModel) - reqBefore; got != 0 {
+		t.Fatalf("request model must not accrue tokens after hot switch, delta = %d", got)
+	}
+}
+
+// A8: 同一 session 的并发 acquire 单飞——第二个请求等待在飞 spawn 完成后复用其
+// worker，而不是并发再起一个进程写同一份 session jsonl。
+func TestAcquireWaitsForInflightSpawn(t *testing.T) {
+	m := newChanManager(chanManagerConfig{})
+	spawnCh := make(chan struct{})
+	m.spawning["s1"] = spawnCh // 模拟已有请求正在 spawn
+
+	type result struct {
+		w   *chanWorker
+		err error
+	}
+	got := make(chan result, 1)
+	go func() {
+		w, err := m.acquire("s1", spawnParams{})
+		got <- result{w, err}
+	}()
+
+	// 等待方必须挂起在 spawning channel 上，而不是自己再 spawn 一个。
+	select {
+	case <-got:
+		t.Fatal("acquire returned before the in-flight spawn finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// spawner 完成：晋升 worker + 释放单飞。
+	w := newWorkerAt("s1", time.Now())
+	m.mu.Lock()
+	m.workers["s1"] = w
+	delete(m.spawning, "s1")
+	m.mu.Unlock()
+	close(spawnCh)
+
+	select {
+	case r := <-got:
+		if r.err != nil {
+			t.Fatalf("acquire after spawn finished: %v", r.err)
+		}
+		if r.w != w {
+			t.Fatal("waiter should reuse the worker promoted by the spawner")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter did not wake after the in-flight spawn finished")
 	}
 }

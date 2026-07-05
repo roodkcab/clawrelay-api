@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"strings"
+
+	"clawrelay-api/pkg/openai"
 )
 
 // claudeEvent is one parsed line of `claude --output-format stream-json`.
@@ -26,6 +28,10 @@ type claudeModelUsage struct {
 	OutputTokens             int `json:"outputTokens"`
 	CacheCreationInputTokens int `json:"cacheCreationInputTokens"`
 	CacheReadInputTokens     int `json:"cacheReadInputTokens"`
+	// CostUSD is per-model cost. Present even on SIGINT-aborted turns (claude
+	// 2.1.199: result subtype=error_during_execution has bare usage all-zero but
+	// modelUsage entries carry real tokens AND costUSD).
+	CostUSD float64 `json:"costUSD"`
 }
 
 // streamAPIEvent mirrors the inner event of a stream_event wrapper, matching
@@ -73,6 +79,41 @@ type claudeUsage struct {
 	OutputTokens             int `json:"output_tokens"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
+}
+
+// perModelCounts 把 result 的 modelUsage 转成 stats.RecordTurn 的输入；
+// modelUsage 为空时回退单条 {fallbackModel: bare usage + totalCost}。
+// 用于 V1（每请求进程）与 ephemeral：这些进程只活一轮，result 里的数字天然是
+// per-turn 值，直接按实际消费的模型归属（子代理/Task 工具可能用别的模型）。
+func perModelCounts(ev *claudeEvent, fallbackModel string) map[string]openai.TokenCounts {
+	if ev == nil {
+		return nil
+	}
+	if len(ev.ModelUsage) > 0 {
+		out := make(map[string]openai.TokenCounts, len(ev.ModelUsage))
+		for model, mu := range ev.ModelUsage {
+			out[model] = openai.TokenCounts{
+				Input:         mu.InputTokens,
+				Output:        mu.OutputTokens,
+				CacheCreation: mu.CacheCreationInputTokens,
+				CacheRead:     mu.CacheReadInputTokens,
+				CostUSD:       mu.CostUSD,
+			}
+		}
+		return out
+	}
+	if ev.Usage == nil {
+		return nil
+	}
+	return map[string]openai.TokenCounts{
+		fallbackModel: {
+			Input:         ev.Usage.InputTokens,
+			Output:        ev.Usage.OutputTokens,
+			CacheCreation: ev.Usage.CacheCreationInputTokens,
+			CacheRead:     ev.Usage.CacheReadInputTokens,
+			CostUSD:       ev.TotalCostUSD,
+		},
+	}
 }
 
 // effectiveUsage returns the token usage to report for a result event. When

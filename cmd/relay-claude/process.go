@@ -147,9 +147,18 @@ func launchClaude(args []string, prompt, workingDir string, envVars map[string]s
 	go func() {
 		defer close(lines)
 		s := bufio.NewScanner(stdoutPipe)
-		s.Buffer(make([]byte, 1024*1024), 1024*1024)
+		// 8MB cap, same as channel.go's drainStdout: a single stream-json line
+		// (e.g. a result event with large tool output) can exceed 1MB, and
+		// bufio.ErrTooLong would silently truncate the stream mid-turn.
+		s.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 		for s.Scan() {
 			lines <- s.Text()
+		}
+		if err := s.Err(); err != nil {
+			// bufio.ErrTooLong (line > 8MB) or a read error: the stream ends
+			// early and the caller may never see a result event (see
+			// EmitFinishIfNoResult for the downstream mitigation).
+			log.Printf("Claude stdout scanner error (stream truncated): %v", err)
 		}
 		stderrDone.Wait()
 		if err := cmd.Wait(); err != nil {
