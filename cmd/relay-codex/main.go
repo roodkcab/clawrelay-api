@@ -143,10 +143,15 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
 	sessionStore.LogRequest(req.SessionID, &req)
 
+	// Retry closure for the dead-thread signature (`codex exec resume` of a
+	// vanished rollout exits 1 with empty stdout): forget the binding and
+	// rebuild the input as a fresh session replaying full history.
+	rebuildFresh := newRebuildFresh(threads, &req, model, sessionDir)
+
 	if req.Stream {
-		handleStreamResponse(w, r, input, chatID, created, model, includeUsage, req.WorkingDir, req.EnvVars, req.SessionID)
+		handleStreamResponse(w, r, input, chatID, created, model, includeUsage, req.WorkingDir, req.EnvVars, req.SessionID, rebuildFresh)
 	} else {
-		handleNonStreamResponse(w, r, input, chatID, created, model, req.WorkingDir, req.EnvVars, req.SessionID)
+		handleNonStreamResponse(w, r, input, chatID, created, model, req.WorkingDir, req.EnvVars, req.SessionID, rebuildFresh)
 	}
 }
 

@@ -24,11 +24,60 @@ import (
 //   item.completed reasoning→ thinking delta with the reasoning text
 //   turn.completed          → finish_reason chunk + usage chunk
 //   error / turn.failed     → server_error response and stream end
-func handleStreamResponse(w http.ResponseWriter, r *http.Request, input codexInput, chatID string, created int64, model string, includeUsage bool, workingDir string, envVars map[string]string, sessionID string) {
-	cmd, lines, err := launchCodex(input, workingDir, envVars)
+//
+// rebuildFresh drops the stale thread binding and rebuilds the input as a
+// fresh full-history session; it is invoked when a resume dies with zero
+// stdout output (see the first-line probe below).
+func handleStreamResponse(w http.ResponseWriter, r *http.Request, input codexInput, chatID string, created int64, model string, includeUsage bool, workingDir string, envVars map[string]string, sessionID string, rebuildFresh func() codexInput) {
+	cmd, lines, waitErr, err := launchCodex(input, workingDir, envVars)
 	if err != nil {
 		openai.WriteError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
+	}
+
+	// ---- First-line probe (CODEX-1) ----------------------------------------
+	// SSE headers are NOT written yet, so we can still answer with a real HTTP
+	// error. Known failure mode (verified empirically): resuming a thread whose
+	// rollout file is gone (~/.codex/sessions cleaned, container rebuilt) makes
+	// codex exit(1) with COMPLETELY EMPTY stdout — the "no rollout found for
+	// thread id ..." text goes to stderr only, so no "error" event ever arrives
+	// and the old code streamed a fake empty success. We detect that as "lines
+	// closed before the first line", forget the dead binding and retry once as
+	// a fresh session with the full history replayed.
+	var firstLine string
+	haveFirst := false
+probe:
+	for attempt := 0; ; attempt++ {
+		select {
+		case <-r.Context().Done():
+			proc.KillGroup(cmd)    // client gone before first byte: nothing to harvest
+			proc.DrainLines(lines) // unblock producer so it reaches cmd.Wait()
+			return
+		case l, ok := <-lines:
+			if ok {
+				firstLine, haveFirst = l, true
+				break probe
+			}
+			// Zero stdout output: codex died before emitting anything.
+			werr := waitErr()
+			if input.IsResume && rebuildFresh != nil && attempt == 0 {
+				log.Printf("[CODEX] resume produced no output (exit err: %v) — forgetting stale thread for session_id=%s, retrying as fresh session", werr, sessionID)
+				input = rebuildFresh()
+				log.Printf("codex retry args: %v (stdin %d bytes)", input.Args, len(input.Stdin))
+				cmd, lines, waitErr, err = launchCodex(input, workingDir, envVars)
+				if err != nil {
+					openai.WriteError(w, http.StatusInternalServerError, "server_error", err.Error())
+					return
+				}
+				continue
+			}
+			msg := "codex produced no output"
+			if werr != nil {
+				msg += ": " + werr.Error()
+			}
+			openai.WriteError(w, http.StatusInternalServerError, "server_error", msg)
+			return
+		}
 	}
 
 	// Disconnect handling is inline in the processLines loop below (single
@@ -120,33 +169,17 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, input codexInp
 	var threadIDSeen string
 	turnFailed := false
 	emittedAnyContent := false
+	sawEvent := false // any successfully parsed JSONL event
 
-processLines:
-	for {
-		var line string
-		var ok bool
-		select {
-		case <-r.Context().Done():
-			proc.KillGroup(cmd)    // disconnect: process is still running, safe to kill
-			proc.DrainLines(lines) // unblock producer so it reaches cmd.Wait()
-			return
-		case <-heartbeat.C:
-			fmt.Fprintf(w, ": keepalive\n\n")
-			flusher.Flush()
-			continue
-		case line, ok = <-lines:
-			if !ok {
-				break processLines
-			}
-		}
-		line = strings.TrimSpace(line)
+	handleLine := func(raw string) {
+		line := strings.TrimSpace(raw)
 		if line == "" || !strings.HasPrefix(line, "{") {
 			// codex sometimes writes non-JSON lines (banner, error logs) to
 			// stdout. Skip silently rather than confusing the client.
 			if line != "" {
 				log.Printf("[CODEX NON-JSON] %s", line)
 			}
-			continue
+			return
 		}
 
 		log.Printf("[CODEX RAW] %s", openai.Truncate(line, 500))
@@ -154,8 +187,9 @@ processLines:
 		var ev codexEvent
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
 			log.Printf("[CODEX PARSE ERR] %v: %s", err, line)
-			continue
+			return
 		}
+		sawEvent = true
 
 		switch ev.Type {
 		case "thread.started":
@@ -170,7 +204,7 @@ processLines:
 
 		case "item.started":
 			if ev.Item == nil {
-				continue
+				return
 			}
 			if ev.Item.Type == "command_execution" {
 				// Surface to client as a tool_call so the UI can render
@@ -181,7 +215,7 @@ processLines:
 
 		case "item.completed":
 			if ev.Item == nil {
-				continue
+				return
 			}
 			switch ev.Item.Type {
 			case "agent_message":
@@ -222,12 +256,58 @@ processLines:
 				errMsg = string(ev.Error)
 			}
 			log.Printf("[CODEX ERROR] %s", errMsg)
-			// If a resume failed because the thread is gone, drop the
-			// stale binding so the next turn starts fresh.
-			if sessionID != "" && input.IsResume && strings.Contains(errMsg, "session") {
+			// CODEX-3: some codex versions attach usage to the failure event.
+			// Record it when present so failed turns still get metered; most
+			// failures carry no usage and that's fine (best-effort).
+			if ev.Usage != nil {
+				inp, out, cr := mapUsage(ev.Usage)
+				stats.Record(model, inp, out, 0, cr, 0)
+				streamUsage = openai.BuildUsageInfo(inp, out, cr, 0)
+			}
+			// If a resume failed because the thread is gone, drop the stale
+			// binding so the next turn starts fresh. Verified real-world text
+			// is "no rollout found for thread id ..." — it contains neither
+			// "session" nor a stable code, hence the three-noun match.
+			if sessionID != "" && input.IsResume && isStaleThreadErr(errMsg) {
 				threads.Forget(sessionID)
 			}
 			textDelta("\n\n[codex error] " + errMsg)
+			emittedAnyContent = true
+		}
+	}
+
+	// The probed first line must flow through the same pipeline as the rest.
+	if haveFirst {
+		handleLine(firstLine)
+	}
+
+processLines:
+	for {
+		select {
+		case <-r.Context().Done():
+			// CODEX-2: client disconnected mid-turn. SIGINT + background
+			// harvest instead of an immediate SIGKILL, so a late
+			// turn.completed usage / thread.started binding isn't lost.
+			abortCodexAndHarvest(cmd, lines, model, sessionID)
+			return
+		case <-heartbeat.C:
+			fmt.Fprintf(w, ": keepalive\n\n")
+			flusher.Flush()
+		case line, ok := <-lines:
+			if !ok {
+				break processLines
+			}
+			handleLine(line)
+		}
+	}
+
+	// CODEX-5 fallback: headers are already written so we can't switch to an
+	// HTTP error anymore. If the whole stream produced no parseable event and
+	// the process exited abnormally (e.g. crashed after the first non-JSON
+	// banner line), surface it as visible text instead of a fake empty success.
+	if !sawEvent {
+		if werr := waitErr(); werr != nil {
+			textDelta("⚠️ [codex] 进程异常退出: " + werr.Error())
 			emittedAnyContent = true
 		}
 	}
@@ -257,67 +337,110 @@ processLines:
 }
 
 // handleNonStreamResponse runs codex to completion and returns one OpenAI
-// chat.completion JSON.
-func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, input codexInput, chatID string, created int64, model string, workingDir string, envVars map[string]string, sessionID string) {
-	cmd, lines, err := launchCodex(input, workingDir, envVars)
+// chat.completion JSON. Like the stream path, a resume that dies with zero
+// stdout output (dead thread rollout) is retried once as a fresh session via
+// rebuildFresh (CODEX-1).
+func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, input codexInput, chatID string, created int64, model string, workingDir string, envVars map[string]string, sessionID string, rebuildFresh func() codexInput) {
+	cmd, lines, waitErr, err := launchCodex(input, workingDir, envVars)
 	if err != nil {
 		openai.WriteError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
 
+	// Note: WatchDisconnect captures the ORIGINAL lines channel; after a retry
+	// relaunch the handler itself keeps ranging over the new channel until the
+	// killed process closes it, so the producer never wedges. getCmd is a
+	// closure so the watcher always signals the current child.
 	defer proc.WatchDisconnect(r.Context(), func() *exec.Cmd { return cmd }, lines)()
 
 	var (
-		fullText  strings.Builder
-		usage     *openai.UsageInfo
-		errorMsg  string
+		fullText     strings.Builder
+		usage        *openai.UsageInfo
+		errorMsg     string
 		threadIDSeen string
 	)
 
-	for line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || !strings.HasPrefix(line, "{") {
-			if line != "" {
-				log.Printf("[CODEX NON-JSON] %s", line)
-			}
-			continue
-		}
-		log.Printf("[CODEX RAW] %s", openai.Truncate(line, 500))
+	for attempt := 0; ; attempt++ {
+		sawEvent := false // any successfully parsed JSONL event this run
 
-		var ev codexEvent
-		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			log.Printf("[CODEX PARSE ERR] %v: %s", err, line)
-			continue
-		}
-
-		switch ev.Type {
-		case "thread.started":
-			threadIDSeen = ev.ThreadID
-			if sessionID != "" {
-				threads.Set(sessionID, ev.ThreadID)
-			}
-		case "item.completed":
-			if ev.Item == nil {
+		for line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" || !strings.HasPrefix(line, "{") {
+				if line != "" {
+					log.Printf("[CODEX NON-JSON] %s", line)
+				}
 				continue
 			}
-			if ev.Item.Type == "agent_message" && ev.Item.Text != "" {
-				fullText.WriteString(ev.Item.Text)
+			log.Printf("[CODEX RAW] %s", openai.Truncate(line, 500))
+
+			var ev codexEvent
+			if err := json.Unmarshal([]byte(line), &ev); err != nil {
+				log.Printf("[CODEX PARSE ERR] %v: %s", err, line)
+				continue
 			}
-		case "turn.completed":
-			if ev.Usage != nil {
-				inp, out, cr := mapUsage(ev.Usage)
-				stats.Record(model, inp, out, 0, cr, 0)
-				usage = openai.BuildUsageInfo(inp, out, cr, 0)
-			}
-		case "error", "turn.failed":
-			errorMsg = ev.Message
-			if errorMsg == "" && len(ev.Error) > 0 {
-				errorMsg = string(ev.Error)
-			}
-			if sessionID != "" && input.IsResume && strings.Contains(errorMsg, "session") {
-				threads.Forget(sessionID)
+			sawEvent = true
+
+			switch ev.Type {
+			case "thread.started":
+				threadIDSeen = ev.ThreadID
+				if sessionID != "" {
+					threads.Set(sessionID, ev.ThreadID)
+				}
+			case "item.completed":
+				if ev.Item == nil {
+					continue
+				}
+				if ev.Item.Type == "agent_message" && ev.Item.Text != "" {
+					fullText.WriteString(ev.Item.Text)
+				}
+			case "turn.completed":
+				if ev.Usage != nil {
+					inp, out, cr := mapUsage(ev.Usage)
+					stats.Record(model, inp, out, 0, cr, 0)
+					usage = openai.BuildUsageInfo(inp, out, cr, 0)
+				}
+			case "error", "turn.failed":
+				errorMsg = ev.Message
+				if errorMsg == "" && len(ev.Error) > 0 {
+					errorMsg = string(ev.Error)
+				}
+				// CODEX-3: failure events may still carry usage — meter them.
+				if ev.Usage != nil {
+					inp, out, cr := mapUsage(ev.Usage)
+					stats.Record(model, inp, out, 0, cr, 0)
+					usage = openai.BuildUsageInfo(inp, out, cr, 0)
+				}
+				if sessionID != "" && input.IsResume && isStaleThreadErr(errorMsg) {
+					threads.Forget(sessionID)
+				}
 			}
 		}
+
+		if sawEvent {
+			break
+		}
+
+		// Zero parseable output: same dead-thread signature as the stream
+		// path (codex exit=1, stdout empty, error only on stderr).
+		werr := waitErr()
+		if input.IsResume && rebuildFresh != nil && attempt == 0 {
+			log.Printf("[CODEX] resume produced no output (exit err: %v) — forgetting stale thread for session_id=%s, retrying as fresh session (non-stream)", werr, sessionID)
+			input = rebuildFresh()
+			log.Printf("codex retry args: %v (stdin %d bytes)", input.Args, len(input.Stdin))
+			cmd2, lines2, waitErr2, lerr := launchCodex(input, workingDir, envVars)
+			if lerr != nil {
+				openai.WriteError(w, http.StatusInternalServerError, "server_error", lerr.Error())
+				return
+			}
+			cmd, lines, waitErr = cmd2, lines2, waitErr2
+			continue
+		}
+		msg := "codex produced no output"
+		if werr != nil {
+			msg += ": " + werr.Error()
+		}
+		openai.WriteError(w, http.StatusInternalServerError, "server_error", msg)
+		return
 	}
 
 	finishReason := "stop"
@@ -351,6 +474,79 @@ func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, input codex
 	json.NewEncoder(w).Encode(resp)
 
 	_ = threadIDSeen
+}
+
+// isStaleThreadErr reports whether a codex error message indicates the
+// resumed thread no longer exists. Verified real-world text is
+// "no rollout found for thread id ..." — it contains NEITHER "session" nor a
+// stable error code, so we match the three nouns codex uses across versions
+// ("session" kept for older/other builds).
+func isStaleThreadErr(errMsg string) bool {
+	m := strings.ToLower(errMsg)
+	return strings.Contains(m, "session") ||
+		strings.Contains(m, "thread") ||
+		strings.Contains(m, "rollout")
+}
+
+// abortCodexAndHarvest handles a client disconnect mid-stream: SIGINT the
+// codex process group (giving the CLI a chance to flush terminal events),
+// then spend up to 8s in the background parsing whatever it still writes so
+// a turn.completed usage payload — and a late thread.started binding — are
+// not lost, before SIGKILLing whatever is left and draining the channel.
+//
+// NOTE: whether codex actually emits turn.completed (with usage) after a
+// SIGINT is UNVERIFIED (no codex credentials on the dev box); claude
+// demonstrably does. Strictly best-effort: if nothing harvestable arrives
+// within the window we only lose what was already lost, and the KillGroup
+// fallback guarantees no process leak either way.
+func abortCodexAndHarvest(cmd *exec.Cmd, lines <-chan string, model, sessionID string) {
+	if cmd != nil && cmd.Process != nil {
+		log.Printf("[CODEX ABORT] client disconnected, SIGINT process group pid=%d (session_id=%s)", cmd.Process.Pid, sessionID)
+	}
+	proc.InterruptGroup(cmd)
+	go func() {
+		deadline := time.NewTimer(8 * time.Second)
+		defer deadline.Stop()
+		for {
+			select {
+			case <-deadline.C:
+				log.Printf("[CODEX ABORT] harvest window expired for session_id=%s, killing process group", sessionID)
+				proc.KillGroup(cmd)
+				proc.DrainLines(lines)
+				return
+			case line, ok := <-lines:
+				if !ok {
+					// Producer closed the channel → child already reaped by
+					// cmd.Wait(). Do NOT KillGroup here: the PID may have been
+					// reused and we'd signal an unrelated process group.
+					return
+				}
+				line = strings.TrimSpace(line)
+				if line == "" || !strings.HasPrefix(line, "{") {
+					continue
+				}
+				var ev codexEvent
+				if json.Unmarshal([]byte(line), &ev) != nil {
+					continue
+				}
+				switch ev.Type {
+				case "thread.started":
+					// Bind even during abort so the NEXT turn can resume this
+					// thread instead of replaying the whole history.
+					if sessionID != "" && ev.ThreadID != "" {
+						threads.Set(sessionID, ev.ThreadID)
+					}
+				case "turn.completed":
+					if ev.Usage != nil {
+						inp, out, cr := mapUsage(ev.Usage)
+						stats.Record(model, inp, out, 0, cr, 0)
+						log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d (codex, harvested after client abort)",
+							model, inp, out, cr)
+					}
+				}
+			}
+		}
+	}()
 }
 
 // mapUsage converts codex's usage shape to the (input, output, cache_read)
