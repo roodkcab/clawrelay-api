@@ -201,9 +201,7 @@ probe:
 		case "thread.started":
 			threadIDSeen = ev.ThreadID
 			log.Printf("[CODEX] thread_id=%s session_id=%s", ev.ThreadID, sessionID)
-			if sessionID != "" {
-				threads.Set(sessionID, ev.ThreadID)
-			}
+			rebindThread(sessionID, ev.ThreadID)
 
 		case "turn.started":
 			// no-op
@@ -248,9 +246,9 @@ probe:
 
 		case "turn.completed":
 			if ev.Usage != nil {
-				input, output, cacheRead := mapUsage(ev.Usage)
+				input, output, cacheRead := turnUsage(sessionID, ev.Usage)
 				stats.Record(model, input, output, 0, cacheRead, 0)
-				log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d (codex)",
+				log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d (codex, per-turn)",
 					model, input, output, cacheRead)
 				streamUsage = openai.BuildUsageInfo(input, output, cacheRead, 0)
 			}
@@ -264,18 +262,23 @@ probe:
 			log.Printf("[CODEX ERROR] %s", errMsg)
 			// CODEX-3: some codex versions attach usage to the failure event.
 			// Record it when present so failed turns still get metered; most
-			// failures carry no usage and that's fine (best-effort).
+			// failures carry no usage and that's fine (best-effort). The
+			// figures are thread-cumulative like any other, so they go
+			// through the same per-turn diff (PR #27).
 			if ev.Usage != nil {
-				inp, out, cr := mapUsage(ev.Usage)
+				inp, out, cr := turnUsage(sessionID, ev.Usage)
 				stats.Record(model, inp, out, 0, cr, 0)
 				streamUsage = openai.BuildUsageInfo(inp, out, cr, 0)
 			}
 			// If a resume failed because the thread is gone, drop the stale
 			// binding so the next turn starts fresh. Verified real-world text
 			// is "no rollout found for thread id ..." — it contains neither
-			// "session" nor a stable code, hence the three-noun match.
+			// "session" nor a stable code, hence the three-noun match. The
+			// usage baseline is tied to that thread's cumulative counter, so
+			// drop it too.
 			if sessionID != "" && input.IsResume && isStaleThreadErr(errMsg) {
 				threads.Forget(sessionID)
+				meter.Forget(sessionID)
 			}
 			textDelta("\n\n[codex error] " + errMsg)
 			emittedAnyContent = true
@@ -389,9 +392,7 @@ func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, input codex
 			switch ev.Type {
 			case "thread.started":
 				threadIDSeen = ev.ThreadID
-				if sessionID != "" {
-					threads.Set(sessionID, ev.ThreadID)
-				}
+				rebindThread(sessionID, ev.ThreadID)
 			case "item.completed":
 				if ev.Item == nil {
 					continue
@@ -401,7 +402,7 @@ func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, input codex
 				}
 			case "turn.completed":
 				if ev.Usage != nil {
-					inp, out, cr := mapUsage(ev.Usage)
+					inp, out, cr := turnUsage(sessionID, ev.Usage)
 					stats.Record(model, inp, out, 0, cr, 0)
 					usage = openai.BuildUsageInfo(inp, out, cr, 0)
 				}
@@ -412,12 +413,13 @@ func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, input codex
 				}
 				// CODEX-3: failure events may still carry usage — meter them.
 				if ev.Usage != nil {
-					inp, out, cr := mapUsage(ev.Usage)
+					inp, out, cr := turnUsage(sessionID, ev.Usage)
 					stats.Record(model, inp, out, 0, cr, 0)
 					usage = openai.BuildUsageInfo(inp, out, cr, 0)
 				}
 				if sessionID != "" && input.IsResume && isStaleThreadErr(errorMsg) {
 					threads.Forget(sessionID)
+					meter.Forget(sessionID)
 				}
 			}
 		}
@@ -561,13 +563,16 @@ func abortCodexAndHarvest(cmd *exec.Cmd, lines <-chan string, model, sessionID s
 				switch ev.Type {
 				case "thread.started":
 					// Bind even during abort so the NEXT turn can resume this
-					// thread instead of replaying the whole history.
-					if sessionID != "" && ev.ThreadID != "" {
-						threads.Set(sessionID, ev.ThreadID)
-					}
+					// thread instead of replaying the whole history (rebind
+					// drops a foreign baseline if the thread rotated).
+					rebindThread(sessionID, ev.ThreadID)
 				case "turn.completed":
 					if ev.Usage != nil {
-						inp, out, cr := mapUsage(ev.Usage)
+						// Same per-turn diff as the foreground paths: the
+						// harvested figures are thread-cumulative, and going
+						// through turnUsage also advances the baseline so the
+						// NEXT turn doesn't re-count this one.
+						inp, out, cr := turnUsage(sessionID, ev.Usage)
 						stats.Record(model, inp, out, 0, cr, 0)
 						log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d (codex, harvested after client abort)",
 							model, inp, out, cr)
@@ -576,6 +581,46 @@ func abortCodexAndHarvest(cmd *exec.Cmd, lines <-chan string, model, sessionID s
 			}
 		}
 	}()
+}
+
+// rebindThread records the codex thread_id for a session. If codex rotated to a
+// DIFFERENT thread (a resume that silently started a fresh thread instead of
+// erroring), the old usage baseline is foreign — the new thread's cumulative
+// counter restarts from zero — so drop it before rebinding, otherwise the next
+// turn would diff against a stale baseline and mis-bill. No-op when meter is nil
+// (handler invoked without main()'s init, e.g. tests).
+//
+// The Get-then-Set is not atomic, but turns for one session are effectively
+// serial (a conversation is request/response, and codex can't resume one thread
+// concurrently), so the rotation-during-concurrent-turn window is not a concern
+// in practice.
+func rebindThread(sessionID, threadID string) {
+	if sessionID == "" || threadID == "" {
+		return
+	}
+	if meter != nil {
+		if prev := threads.Get(sessionID); prev != "" && prev != threadID {
+			meter.Forget(sessionID)
+		}
+	}
+	threads.Set(sessionID, threadID)
+}
+
+// turnUsage resolves one turn's reportable (input, output, cache_read) from
+// codex's reported usage. codex reports thread-cumulative totals on resume, so
+// the meter diffs against the session's baseline to recover this turn's figure;
+// without that diff a resumed thread's usage climbs monotonically and every turn
+// re-counts all earlier turns.
+//
+// Assumes exactly one turn.completed per request (codex's `exec` contract): each
+// call advances the persisted baseline, so multiple turn.completed in one request
+// would each bill their own delta correctly but only the last would reach the
+// client's usage chunk.
+func turnUsage(sessionID string, u *codexUsage) (input, output, cacheRead int) {
+	if meter == nil { // defensive: handler invoked without main()'s init (tests)
+		return mapUsage(u)
+	}
+	return meter.perTurn(sessionID, *u)
 }
 
 // mapUsage converts codex's usage shape to the (input, output, cache_read)

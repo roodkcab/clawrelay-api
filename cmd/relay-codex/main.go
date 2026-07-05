@@ -31,7 +31,8 @@ import (
 	"clawrelay-api/pkg/sessions"
 )
 
-// version 1.1.6 被生产二进制占用但源码从未入库（版本漂移事故），跳到 1.1.7
+// version 1.1.6 被生产二进制占用但源码从未入库（版本漂移事故）；本分支合入了
+// 该幽灵 1.1.6 的源码内容（usage 跨轮差分，PR #27），正式版本号为 1.1.7，
 // 以保证线上版本号可比较；buildCommit 让 /health 能定位构建源。
 var version = "1.1.7"
 
@@ -59,6 +60,7 @@ var allowedOrigins = []string{
 var (
 	sessionStore *sessions.Store
 	threads      *threadMap
+	meter        *usageMeter
 	stats        = openai.NewStats()
 )
 
@@ -235,6 +237,7 @@ func main() {
 	sessionStore = sessions.New(*sessionsDir)
 	sessionStore.StartCleanup(72*time.Hour, 1*time.Hour)
 	threads = newThreadMap(sessionStore.AbsDir())
+	meter = newUsageMeter(sessionStore.AbsDir())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", chatCompletionsHandler)

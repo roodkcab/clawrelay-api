@@ -271,6 +271,12 @@ func flattenForFreshSession(messages []openai.ChatMessage, sessionDir string) (p
 func newRebuildFresh(threads *threadMap, req *openai.ChatCompletionRequest, model, sessionDir string) func() codexInput {
 	return func() codexInput {
 		threads.Forget(req.SessionID)
+		// The replacement thread restarts its cumulative counter from zero;
+		// keeping the old high-water baseline would clamp every following
+		// turn's diff to 0 (under-billing) until the new thread caught up.
+		if meter != nil {
+			meter.Forget(req.SessionID)
+		}
 		return buildCodexInput(req, model, "", sessionDir)
 	}
 }
