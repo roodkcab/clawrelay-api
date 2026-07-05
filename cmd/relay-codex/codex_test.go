@@ -155,6 +155,70 @@ func TestResolveCodexUploadDir(t *testing.T) {
 	}
 }
 
+// TestIsStaleThreadErr locks in the CODEX-1 keyword fix: the verified
+// real-world dead-thread error is "no rollout found for thread id ..." —
+// it contains neither "session" (the only keyword the old code matched) nor
+// any stable error code.
+func TestIsStaleThreadErr(t *testing.T) {
+	cases := []struct {
+		msg  string
+		want bool
+	}{
+		{"no rollout found for thread id 01997e2d-ab12", true},
+		{"ROLLOUT file missing", true}, // case-insensitive
+		{"thread 01997e2d not found", true},
+		{"session expired", true},
+		{"rate limit exceeded, retry later", false},
+		{"stream error: connection reset", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := isStaleThreadErr(c.msg); got != c.want {
+			t.Errorf("isStaleThreadErr(%q) = %v, want %v", c.msg, got, c.want)
+		}
+	}
+}
+
+// TestNewRebuildFreshForgetsAndReplaysFullHistory: the retry closure must
+// (1) drop the stale session→thread binding and (2) rebuild the input as a
+// non-resume invocation that replays the FULL message history — a fresh codex
+// session knows nothing, so sending only the latest turn would lose context.
+func TestNewRebuildFreshForgetsAndReplaysFullHistory(t *testing.T) {
+	tm := newThreadMap(t.TempDir())
+	tm.Set("sess-1", "thread-dead")
+
+	req := &openai.ChatCompletionRequest{
+		SessionID: "sess-1",
+		Messages: []openai.ChatMessage{
+			{Role: "system", Content: json.RawMessage(`"rules"`)},
+			{Role: "user", Content: json.RawMessage(`"第一轮提问"`)},
+			{Role: "assistant", Content: json.RawMessage(`"第一轮答复"`)},
+			{Role: "user", Content: json.RawMessage(`"第二轮提问"`)},
+		},
+	}
+
+	rebuild := newRebuildFresh(tm, req, "codex/gpt-5.4", "")
+	in := rebuild()
+
+	if in.IsResume {
+		t.Fatal("rebuilt input must not be a resume")
+	}
+	if strings.Contains(strings.Join(in.Args, " "), "resume") {
+		t.Fatalf("rebuilt args must not contain resume: %v", in.Args)
+	}
+	if got := tm.Get("sess-1"); got != "" {
+		t.Fatalf("stale binding not forgotten: %q", got)
+	}
+	for _, want := range []string{"第一轮提问", "第一轮答复", "第二轮提问"} {
+		if !strings.Contains(in.Stdin, want) {
+			t.Fatalf("fresh rebuild must replay full history, missing %q; got:\n%s", want, in.Stdin)
+		}
+	}
+	if !strings.HasPrefix(in.Stdin, `<system_rules priority="highest">`) {
+		t.Fatalf("rebuilt stdin missing system_rules block; got:\n%s", in.Stdin)
+	}
+}
+
 func jsonEscape(s string) string {
 	b, _ := json.Marshal(s)
 	return strings.Trim(string(b), `"`)

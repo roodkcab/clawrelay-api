@@ -59,19 +59,24 @@ func (t *threadMap) Get(sessionID string) string {
 }
 
 // Set binds a session_id to a codex thread_id and writes through to disk.
-// Idempotent; the on-disk path is created lazily.
+// The on-disk path is created lazily.
+//
+// Deliberately NO same-value short-circuit: codex keeps the same thread_id
+// for the whole conversation, and for bots that run with a working_dir no
+// attachments ever land in this session directory — so without the rewrite
+// the file's (and directory's) mtime would stay frozen at turn #1 and the
+// sessions store's age-based cleanup could reap the binding of a session
+// that is active every day. Rewriting the identical value each turn
+// refreshes the mtime and doubles as a liveness beacon for the cleanup
+// (second line of defense next to the cleanup's max-child-mtime check).
 func (t *threadMap) Set(sessionID, threadID string) {
 	if sessionID == "" || threadID == "" {
 		return
 	}
 
 	t.mu.Lock()
-	existing, had := t.memory[sessionID]
 	t.memory[sessionID] = threadID
 	t.mu.Unlock()
-	if had && existing == threadID {
-		return
-	}
 
 	dir := filepath.Join(t.rootDir, sessionID)
 	if err := os.MkdirAll(dir, 0755); err != nil {
