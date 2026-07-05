@@ -76,6 +76,51 @@ func (s *Stats) Record(model string, input, output, cacheCreation, cacheRead int
 	ms.CostUSD += costUSD
 }
 
+// TokenCounts is one model's share of a single turn, used by RecordTurn to
+// attribute sub-agent (Task tool) tokens to the model that actually consumed
+// them instead of lumping everything under the requested model.
+type TokenCounts struct {
+	Input         int
+	Output        int
+	CacheCreation int
+	CacheRead     int
+	CostUSD       float64
+}
+
+// RecordTurn registers one completed turn whose usage is split per actual
+// model (claude's result.modelUsage shape). The turn counts as ONE request,
+// attributed to requestModel; token/cost figures accrue to each real model's
+// row. An empty perModel map still counts the request.
+func (s *Stats) RecordTurn(requestModel string, perModel map[string]TokenCounts) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requests++
+	rm, ok := s.perModel[requestModel]
+	if !ok {
+		rm = &ModelTokenStats{}
+		s.perModel[requestModel] = rm
+	}
+	rm.Requests++
+	for model, c := range perModel {
+		s.input += int64(c.Input)
+		s.output += int64(c.Output)
+		s.cacheCreation += int64(c.CacheCreation)
+		s.cacheRead += int64(c.CacheRead)
+		s.costUSD += c.CostUSD
+		ms, ok := s.perModel[model]
+		if !ok {
+			ms = &ModelTokenStats{}
+			s.perModel[model] = ms
+		}
+		ms.Input += int64(c.Input)
+		ms.Output += int64(c.Output)
+		ms.CacheCreation += int64(c.CacheCreation)
+		ms.CacheRead += int64(c.CacheRead)
+		ms.Total += int64(c.Input + c.Output + c.CacheCreation + c.CacheRead)
+		ms.CostUSD += c.CostUSD
+	}
+}
+
 // Snapshot returns a deep-copied view safe for marshaling.
 func (s *Stats) Snapshot() TokenStatsSnapshot {
 	s.mu.Lock()

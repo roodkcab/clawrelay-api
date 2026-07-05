@@ -53,6 +53,24 @@ func KillGroup(cmd *exec.Cmd) {
 	}
 }
 
+// InterruptGroup SIGINTs the entire process group of cmd, asking the CLI to
+// abort gracefully. Unlike KillGroup, a SIGINTed `claude` still emits a final
+// `result` event (subtype error_during_execution) whose modelUsage carries the
+// interrupted turn's real token counts — callers use this to account for
+// aborted turns before falling back to KillGroup.
+func InterruptGroup(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	pid := cmd.Process.Pid
+	if pid <= 0 {
+		return
+	}
+	if err := syscall.Kill(-pid, syscall.SIGINT); err != nil {
+		_ = cmd.Process.Signal(syscall.SIGINT)
+	}
+}
+
 // DrainLines drains the producer's output channel in the background so a
 // goroutine blocked on `lines <- ...` (consumer stopped reading) unblocks,
 // completes its scan loop and runs cmd.Wait(), preventing a <defunct> zombie.
