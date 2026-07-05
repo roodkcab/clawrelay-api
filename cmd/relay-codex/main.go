@@ -31,7 +31,7 @@ import (
 	"clawrelay-api/pkg/sessions"
 )
 
-var version = "1.1.5"
+var version = "1.1.6"
 
 var defaultModel = "codex/gpt-5.5"
 
@@ -52,6 +52,7 @@ var allowedOrigins = []string{
 var (
 	sessionStore *sessions.Store
 	threads      *threadMap
+	meter        *usageMeter
 	stats        = openai.NewStats()
 )
 
@@ -222,6 +223,7 @@ func main() {
 	sessionStore = sessions.New(*sessionsDir)
 	sessionStore.StartCleanup(72*time.Hour, 1*time.Hour)
 	threads = newThreadMap(sessionStore.AbsDir())
+	meter = newUsageMeter(sessionStore.AbsDir())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", chatCompletionsHandler)
