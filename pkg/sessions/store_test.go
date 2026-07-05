@@ -1,8 +1,11 @@
 package sessions
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -116,5 +119,84 @@ func TestCleanupRemovesFullyStaleSession(t *testing.T) {
 	}
 	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
 		t.Fatalf("stale jsonl should be removed, stat err=%v", err)
+	}
+}
+
+// TestAppendCapsInMemoryEvents: the in-memory buffer must stay bounded for
+// long-lived sessions, dropping the oldest half past the cap and marking the
+// cut with a "truncated" event; the on-disk jsonl keeps everything.
+func TestAppendCapsInMemoryEvents(t *testing.T) {
+	dir := t.TempDir()
+	s := New(dir)
+	entry := s.GetOrCreate("longlived")
+
+	total := maxBufferedEvents + 100
+	for i := 0; i < total; i++ {
+		data, _ := json.Marshal(map[string]string{"text": fmt.Sprintf("d%d", i)})
+		entry.Append(Event{Timestamp: time.Now().Format(time.RFC3339Nano), Type: "response_delta", Data: data})
+	}
+
+	events := entry.Events()
+	if len(events) > maxBufferedEvents {
+		t.Fatalf("in-memory events not capped: len=%d > %d", len(events), maxBufferedEvents)
+	}
+	if events[0].Type != "truncated" {
+		t.Fatalf("first buffered event should be the truncation marker, got %q", events[0].Type)
+	}
+	var marker struct {
+		Dropped int `json:"dropped"`
+	}
+	if err := json.Unmarshal(events[0].Data, &marker); err != nil || marker.Dropped == 0 {
+		t.Fatalf("truncation marker missing dropped count: data=%s err=%v", events[0].Data, err)
+	}
+	// Newest event survives the trim.
+	last := events[len(events)-1]
+	if !strings.Contains(string(last.Data), fmt.Sprintf("d%d", total-1)) {
+		t.Fatalf("newest event lost in trim: %s", last.Data)
+	}
+
+	// Disk log is unaffected by the memory cap: all appends are on disk.
+	data, err := os.ReadFile(filepath.Join(dir, "longlived.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines := strings.Count(string(data), "\n"); lines != total {
+		t.Fatalf("disk log should keep all %d events, has %d lines", total, lines)
+	}
+}
+
+// TestCleanupClosesEntryBeforeUnlink locks in the race fix: a handler that
+// grabbed the *Entry before cleanup must not resurrect state — its late
+// Appends are no-ops (closed flag, nil logFile), and the unlinked jsonl stays
+// gone.
+func TestCleanupClosesEntryBeforeUnlink(t *testing.T) {
+	dir := t.TempDir()
+	s := New(dir)
+
+	entry := s.GetOrCreate("inflight")
+	entry.Append(Event{Timestamp: time.Now().Format(time.RFC3339Nano), Type: "request", Data: json.RawMessage(`{}`)})
+
+	logPath := filepath.Join(dir, "inflight.jsonl")
+	if err := os.Chtimes(logPath, aged(), aged()); err != nil {
+		t.Fatal(err)
+	}
+
+	s.cleanupOldSessions(72 * time.Hour)
+
+	if s.Get("inflight") != nil {
+		t.Fatal("cleaned-up session still in store map")
+	}
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Fatalf("stale jsonl should be removed, stat err=%v", err)
+	}
+
+	// The handler still holds the old pointer and keeps logging.
+	before := len(entry.Events())
+	entry.Append(Event{Timestamp: time.Now().Format(time.RFC3339Nano), Type: "response_delta", Data: json.RawMessage(`{"text":"late"}`)})
+	if got := len(entry.Events()); got != before {
+		t.Fatalf("Append on a closed entry grew events: %d -> %d", before, got)
+	}
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Fatalf("late Append resurrected the jsonl, stat err=%v", err)
 	}
 }
