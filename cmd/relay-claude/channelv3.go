@@ -71,13 +71,21 @@ type v3Waiter struct {
 
 // v3Session wraps one interactive claude process (+ its channel bridge).
 type v3Session struct {
-	sid       string
-	cmd       *exec.Cmd
-	ptmx      *os.File
-	mcpFile   string // per-session --mcp-config path (cleaned up on stop)
-	dead      atomic.Bool
-	lastUsed  atomic.Int64
-	inTurn    atomic.Bool
+	sid      string
+	cmd      *exec.Cmd
+	ptmx     *os.File
+	mcpFile  string // per-session --mcp-config path (cleaned up on stop)
+	dead     atomic.Bool
+	lastUsed atomic.Int64
+	inTurn   atomic.Bool
+	// turnSlot 是本会话 turn 的独占令牌（容量 1，launch 时放入一枚）。V2 用
+	// turnMu 串行化同 session 请求，V3 此前没有等价物——并发的第二个请求会把
+	// 消息 enqueue 给还在忙的 claude，等不到任何带自己 req_id 的事件，5 分钟后
+	// 被冷启动 watchdog 误判为冻死，反手 SIGKILL 掉正在服务上一轮的进程。必须
+	// 持有令牌才能 enqueue/等回复；用 channel 而非 mutex 是为了等待时能同时
+	// select ctx.Done / deadCh / 心跳。
+	turnSlot  chan struct{}
+	reaped    atomic.Bool // cmd.Wait() 已返回：进程已收割、PID 可能复用，禁止再裸 kill 组
 	deadCh    chan struct{}
 	ready     chan struct{} // closed once the channel is registered + event loop is live
 	readyOnce sync.Once
@@ -114,6 +122,11 @@ type v3Manager struct {
 	sessions map[string]*v3Session
 	inbox    map[string]chan v3Msg // sid -> queued inbound turns (drained by /v3/next)
 	waiters  map[string]*v3Waiter  // req_id -> reply waiter (chunks + final reply)
+	// launching single-flights acquire() per sid（与 V2 chanManager.spawning 同构，
+	// A8）：第一个请求登记 channel 并 launch，同 sid 并发请求等它完成后重查，
+	// 而不是各自再起一个交互式 claude——败者会被覆盖成永久泄漏的重量级进程，
+	// 且两个 bridge 会同时抢同一个 inbox 的消息。
+	launching map[string]chan struct{}
 }
 
 func newV3Manager(cfg v3Config) *v3Manager {
@@ -145,10 +158,11 @@ func newV3Manager(cfg v3Config) *v3Manager {
 		}
 	}
 	return &v3Manager{
-		cfg:      cfg,
-		sessions: make(map[string]*v3Session),
-		inbox:    make(map[string]chan v3Msg),
-		waiters:  make(map[string]*v3Waiter),
+		cfg:       cfg,
+		sessions:  make(map[string]*v3Session),
+		inbox:     make(map[string]chan v3Msg),
+		waiters:   make(map[string]*v3Waiter),
+		launching: make(map[string]chan struct{}),
 	}
 }
 
@@ -183,7 +197,17 @@ func (m *v3Manager) handleNext(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing session", http.StatusBadRequest)
 		return
 	}
-	q := m.inboxFor(sid)
+	// 只查不建：inbox 与 session 同生共死（acquire 促升时创建、teardown 时删除）。
+	// 之前这里会为已死/未知 sid 重建条目——被拆掉会话的 bridge 在退出前的最后一次
+	// poll 就能让 map 无界增长，且残留条目会把过期消息重放进同 sid 的下一个会话。
+	// 404 让孤儿 bridge 走它的 1s 退避重试，直到随 claude 进程组一起被收掉。
+	m.mu.Lock()
+	q := m.inbox[sid]
+	m.mu.Unlock()
+	if q == nil {
+		http.Error(w, "unknown session", http.StatusNotFound)
+		return
+	}
 	select {
 	case msg := <-q:
 		w.Header().Set("Content-Type", "application/json")
@@ -250,19 +274,25 @@ func (m *v3Manager) deliver(reqID string, ev v3ReplyEvent) bool {
 	}
 }
 
-func (m *v3Manager) inboxFor(sid string) chan v3Msg {
+// enqueue hands one inbound turn to the session's bridge. 裸 send 会在 inbox
+// 满（bridge 挂死不 poll）时把 handler goroutine 永远吊住——turn 串行化下正常
+// 永远不会满（同时最多一条在途），所以走到超时/无 inbox 本身就说明会话已坏，
+// 交给调用方按 coldHang 处理。
+func (m *v3Manager) enqueue(ctx context.Context, sid string, msg v3Msg) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	q := m.inbox[sid]
+	m.mu.Unlock()
 	if q == nil {
-		q = make(chan v3Msg, 8)
-		m.inbox[sid] = q
+		return fmt.Errorf("no inbox for session %s (torn down?)", sid)
 	}
-	return q
-}
-
-func (m *v3Manager) enqueue(sid string, msg v3Msg) {
-	m.inboxFor(sid) <- msg
+	select {
+	case q <- msg:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf("inbox for session %s stuck full (bridge not polling?)", sid)
+	}
 }
 
 // killSession kills the interactive claude (+ its bun bridge) for sid and removes
@@ -281,9 +311,16 @@ func (m *v3Manager) killSession(sid string) {
 }
 
 // drainInbox empties any undelivered inbound turns for a session — used before a
-// cold-start retry so the relaunched bridge doesn't inject a stale duplicate.
+// cold-start retry (so the relaunched bridge doesn't inject a stale duplicate)
+// and on client disconnect (turn 串行化下队列里只可能是断连请求自己那条还没被
+// bridge 取走的消息，留着会污染同 session 的下一轮)。只查不建。
 func (m *v3Manager) drainInbox(sid string) {
-	q := m.inboxFor(sid)
+	m.mu.Lock()
+	q := m.inbox[sid]
+	m.mu.Unlock()
+	if q == nil {
+		return
+	}
 	for {
 		select {
 		case <-q:
@@ -477,35 +514,82 @@ type v3SpawnParams struct {
 }
 
 // acquire returns a live interactive session for sid, launching one if needed.
-func (m *v3Manager) acquire(sid string, p v3SpawnParams) (*v3Session, error) {
-	m.mu.Lock()
-	if s := m.sessions[sid]; s != nil && !s.Dead() {
-		s.markUsed()
+// Launching is single-flighted per sid: concurrent requests that miss the
+// registry wait for the in-progress launch and re-check instead of racing a
+// second interactive claude onto the same sid（败者会被 map 覆盖成不可达的
+// 永久泄漏进程，且两个 bridge 同时 poll 同一 inbox，消息被随机抢走）。ctx 让
+// 已断连的客户端不再排队接盘下一次 launch。
+func (m *v3Manager) acquire(ctx context.Context, sid string, p v3SpawnParams) (*v3Session, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("acquire session %s: %w", sid, err)
+		}
+		m.mu.Lock()
+		if s := m.sessions[sid]; s != nil && !s.Dead() {
+			s.markUsed()
+			m.mu.Unlock()
+			return s, nil
+		}
+		// 死会话(或从没存在)的 inbox 一并清掉：否则 relaunch 失败时 acquire 从
+		// map 摘掉死会话后直接返回错误，而 onSessionDie 又因 map 里已无此会话而
+		// 不兜底删 inbox → 孤儿 inbox 泄漏。促升成功时下方会重建。
+		delete(m.sessions, sid)
+		delete(m.inbox, sid)
+		if ch, ok := m.launching[sid]; ok {
+			// Someone else is launching this sid: wait for it and re-check（它
+			// 可能促升了活会话，也可能失败——那时本请求成为下一个 launcher）。
+			m.mu.Unlock()
+			select {
+			case <-ch:
+			case <-ctx.Done():
+				return nil, fmt.Errorf("acquire session %s: %w", sid, ctx.Err())
+			}
+			continue
+		}
+		launchCh := make(chan struct{})
+		m.launching[sid] = launchCh
+		if m.cfg.MaxSessions > 0 {
+			alive := 0
+			for _, s := range m.sessions {
+				if !s.Dead() {
+					alive++ // count ALL live sessions (incl. inTurn) toward the cap
+				}
+			}
+			if alive >= m.cfg.MaxSessions {
+				m.evictOldestLocked() // frees an idle session if any; logs if all busy
+			}
+		}
+		m.mu.Unlock()
+
+		s, err := m.launch(sid, p)
+
+		// Release the single-flight and promote in the SAME critical section,
+		// so a waiter's re-check either sees the live session or finds
+		// launching empty and takes over.
+		m.mu.Lock()
+		delete(m.launching, sid)
+		close(launchCh)
+		if err != nil {
+			m.mu.Unlock()
+			return nil, err
+		}
+		if existing := m.sessions[sid]; existing != nil && !existing.Dead() && existing != s {
+			// 理论上单飞后到不了这里；防御：已有活会话就杀掉新 launch 的，
+			// 保证同一 sid 永远只有一个交互式 claude + bridge。
+			m.mu.Unlock()
+			log.Printf("[v3] WARN session=%s: live session appeared during launch; killing the duplicate", sid)
+			s.kill()
+			return existing, nil
+		}
+		m.sessions[sid] = s
+		// inbox 与 session 同生共死：促升时创建（bridge 起来后第一次 poll 就有
+		// 东西可等），teardown（killSession/reap/evict/onSessionDie/Stop）时删除。
+		if m.inbox[sid] == nil {
+			m.inbox[sid] = make(chan v3Msg, 8)
+		}
 		m.mu.Unlock()
 		return s, nil
 	}
-	delete(m.sessions, sid)
-	if m.cfg.MaxSessions > 0 {
-		alive := 0
-		for _, s := range m.sessions {
-			if !s.Dead() {
-				alive++ // count ALL live sessions (incl. inTurn) toward the cap
-			}
-		}
-		if alive >= m.cfg.MaxSessions {
-			m.evictOldestLocked() // frees an idle session if any; logs if all busy
-		}
-	}
-	m.mu.Unlock()
-
-	s, err := m.launch(sid, p)
-	if err != nil {
-		return nil, err
-	}
-	m.mu.Lock()
-	m.sessions[sid] = s
-	m.mu.Unlock()
-	return s, nil
 }
 
 // launch starts an interactive claude (in a PTY) with the channel bridge.
@@ -565,7 +649,8 @@ func (m *v3Manager) launch(sid string, p v3SpawnParams) (*v3Session, error) {
 
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 50, Cols: 160})
 	if err != nil {
-		os.Remove(mcpFile)
+		// .mcp.json 是 bot working_dir 里的共享文件（可能含用户自己的 MCP
+		// server），启动失败不能顺手删掉它——留着无害，下次 launch 还会复用。
 		return nil, fmt.Errorf("pty start claude: %w", err)
 	}
 
@@ -576,10 +661,12 @@ func (m *v3Manager) launch(sid string, p v3SpawnParams) (*v3Session, error) {
 		mcpFile:    mcpFile,
 		deadCh:     make(chan struct{}),
 		ready:      make(chan struct{}),
+		turnSlot:   make(chan struct{}, 1),
 		bound:      p.model,
 		claudeSID:  claudeSID,
 		prevReqIDs: make(map[string]struct{}),
 	}
+	s.turnSlot <- struct{}{} // 一枚令牌 = 同时最多一个 turn
 	if v3DebugPTY {
 		if f, err := os.Create(filepath.Join(os.TempDir(), "v3pty-"+sid+".log")); err == nil {
 			s.ptyLog = f
@@ -590,6 +677,7 @@ func (m *v3Manager) launch(sid string, p v3SpawnParams) (*v3Session, error) {
 	go s.drivePTY()
 	go func() {
 		_ = cmd.Wait()
+		s.reaped.Store(true) // 进程已收割：此后 PID 可能被复用，kill() 不得再裸 kill 组
 		s.dead.Store(true)
 		close(s.deadCh)
 		ptmx.Close()
@@ -603,15 +691,26 @@ func (m *v3Manager) launch(sid string, p v3SpawnParams) (*v3Session, error) {
 	return s, nil
 }
 
+// mcpJSONMu serializes read-modify-write of .mcp.json files: 同一 bot
+// working_dir 的多个会话并发 launch 时，无锁的读改写会互相丢更新。写入频率
+// 极低（每次 launch 一次），全局一把锁足够。
+var mcpJSONMu sync.Mutex
+
 // ensureBridgeInMCPJSON merges the relaybridge channel server into the cwd's
 // .mcp.json (creating it if absent, preserving any existing servers). The env
 // only overrides the proxy: the bridge inherits RELAY_CTRL/RELAY_SESSION from
 // claude's per-process env, but must NOT use the chroot's HTTP_PROXY for its
 // loopback calls to the relay.
 func ensureBridgeInMCPJSON(path, bridgeTS string) error {
+	mcpJSONMu.Lock()
+	defer mcpJSONMu.Unlock()
 	cfg := map[string]any{}
-	if data, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(data, &cfg)
+	if data, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(data)) != "" {
+		// 解析失败必须拒绝而不是静默清空：文件里可能是用户手写的 MCP 配置，
+		// 一个多余的逗号不该换来整份配置被覆盖。launch 失败的报错会带上原因。
+		if uerr := json.Unmarshal(data, &cfg); uerr != nil {
+			return fmt.Errorf("existing %s is not valid JSON (%v) — fix or remove it before v3 can launch here", path, uerr)
+		}
 	}
 	servers, _ := cfg["mcpServers"].(map[string]any)
 	if servers == nil {
@@ -631,7 +730,12 @@ func ensureBridgeInMCPJSON(path, bridgeTS string) error {
 	}
 	cfg["mcpServers"] = servers
 	data, _ := json.MarshalIndent(cfg, "", "  ")
-	return os.WriteFile(path, data, 0o644)
+	// 原子替换：claude 启动时随时可能读这份文件，写一半的 JSON 会让它启动失败。
+	tmp := path + ".relaytmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // startup prompts that interactive claude shows; we answer each once by sending
@@ -695,8 +799,12 @@ func (s *v3Session) drivePTY() {
 func (s *v3Session) kill() {
 	s.dead.Store(true)
 	// claude was started via pty.Start (setsid → session/group leader), so a
-	// group kill reaps the claude tree and its spawned bun bridge.
-	proc.KillGroup(s.cmd)
+	// group kill reaps the claude tree and its spawned bun bridge. reaped 后
+	// 禁止再发：进程已被 cmd.Wait() 收割，PID 可能已复用，kill(-pid) 会误杀
+	// 无关进程组（pkg/proc WatchDisconnect 注释警告过的同一坑）。
+	if !s.reaped.Load() {
+		proc.KillGroup(s.cmd)
+	}
 	if s.ptmx != nil {
 		s.ptmx.Close()
 	}
@@ -704,8 +812,11 @@ func (s *v3Session) kill() {
 
 func (m *v3Manager) onSessionDie(sid string) {
 	m.mu.Lock()
+	// 仅当 map 里就是这个死会话时才清理：冷启动重试会 kill 旧会话再促升新会话，
+	// 旧会话的 onDie 可能晚到——那时 map 里已是活的新会话（连同新 inbox），不能误删。
 	if s := m.sessions[sid]; s != nil && s.Dead() {
 		delete(m.sessions, sid)
+		delete(m.inbox, sid)
 	}
 	m.mu.Unlock()
 }
@@ -729,6 +840,7 @@ func (m *v3Manager) evictOldestLocked() {
 	}
 	s := m.sessions[oldest]
 	delete(m.sessions, oldest)
+	delete(m.inbox, oldest)
 	log.Printf("[v3] capacity evict session=%s", oldest)
 	go func() {
 		m.flushV3Orphan(s, "evict")
@@ -759,11 +871,13 @@ func (m *v3Manager) reapOnce() {
 	for k, s := range m.sessions {
 		if s.Dead() {
 			delete(m.sessions, k)
+			delete(m.inbox, k)
 			continue
 		}
 		if !s.inTurn.Load() && s.LastUsed().Before(cutoff) {
 			toKill = append(toKill, s)
 			delete(m.sessions, k)
+			delete(m.inbox, k)
 		}
 	}
 	m.mu.Unlock()
@@ -774,14 +888,22 @@ func (m *v3Manager) reapOnce() {
 	}
 }
 
-// Stop kills every interactive session (shutdown).
+// Stop kills every interactive session (shutdown). 先摘表再收尸：flushV3Orphan
+// 要做文件 IO，不能压着 m.mu 干；SIGTERM 后紧接 os.Exit，这里是重启前未收割
+// 尾巴 token 的最后入账机会。
 func (m *v3Manager) Stop() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	sessions := make([]*v3Session, 0, len(m.sessions))
 	for _, s := range m.sessions {
-		s.kill()
+		sessions = append(sessions, s)
 	}
 	m.sessions = make(map[string]*v3Session)
+	m.inbox = make(map[string]chan v3Msg)
+	m.mu.Unlock()
+	for _, s := range sessions {
+		m.flushV3Orphan(s, "stop")
+		s.kill()
+	}
 }
 
 func (m *v3Manager) snapshot() []map[string]any {
@@ -845,28 +967,23 @@ func handleChannelV3Response(w http.ResponseWriter, r *http.Request, req *openai
 		allowedTools: req.AllowedTools,
 		addDirs:      req.AddDirs,
 	}
-	sess, err := v3Mgr.acquire(sid, p)
-	if err != nil {
-		log.Printf("[v3] acquire failed session=%s: %v", sid, err)
-		openai.WriteError(w, http.StatusInternalServerError, "server_error", err.Error())
-		return
-	}
-	sess.inTurn.Store(true)
-	defer func() { sess.inTurn.Store(false); sess.markUsed() }()
-	// One-off (no-session, e.g. cron) sessions are never reusable — tear the
-	// interactive claude + bun bridge down at turn end instead of leaking a heavy
-	// process until the idle reaper fires. (sid is captured; a cold-start retry
-	// reassigns sess but keeps sid, so this kills whatever is mapped to sid.)
-	if ephemeral {
-		defer v3Mgr.killSession(sid)
-	}
-
 	reqID := v3ReqID()
 	waiter := v3Mgr.registerWaiter(reqID)
 	defer v3Mgr.unregisterWaiter(reqID)
 
-	// SSE headers + initial ping (also keeps the client alive during a slow
-	// first-launch readiness wait).
+	// One-off (no-session, e.g. cron) sessions are never reusable — tear the
+	// interactive claude + bun bridge down at turn end instead of leaking a heavy
+	// process until the idle reaper fires. 必须在 acquireTurn 之前注册：launch
+	// 成功后、拿到 turn 令牌前客户端就断开的话，这个 defer 是唯一的回收路径。
+	// (sid is captured; a cold-start retry reassigns sess but keeps sid, so this
+	// kills whatever is mapped to sid. 对未促升的 sid 是 no-op。)
+	if ephemeral {
+		defer v3Mgr.killSession(sid)
+	}
+
+	// SSE headers + initial ping BEFORE acquiring anything: 排队等同 session 上
+	// 一轮、冷启动、launch 全都可能耗时，期间必须持续有字节可发（wuji adapter
+	// sock_read=120s），头一旦发出，后续错误也只能走 SSE 错误块而非 JSON 错误。
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -890,6 +1007,67 @@ func handleChannelV3Response(w http.ResponseWriter, r *http.Request, req *openai
 	// shows movement so it never looks dead.
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
+
+	sseFail := func(msg string) {
+		fmt.Fprintf(w, "data: %s\n\n", v3ErrChunk(chatID, created, model, msg))
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}
+
+	// acquireTurn 拿到 sid 的活会话并独占其 turn 令牌。等待期间发可见的排队心跳；
+	// 会话换代（冷启动重试杀旧拉新）时通过 deadCh/死令牌回到 re-acquire。返回
+	// false 表示客户端已断开或 launch 失败（后者已发 SSE 错误块）。
+	acquireTurn := func() (*v3Session, bool) {
+		for {
+			s2, err := v3Mgr.acquire(r.Context(), sid, p)
+			if err != nil {
+				if r.Context().Err() != nil {
+					log.Printf("[v3] client gone while acquiring session=%s req=%s", sid, reqID)
+					return nil, false
+				}
+				log.Printf("[v3] acquire failed session=%s req=%s: %v", sid, reqID, err)
+				sseFail("session launch failed: " + err.Error())
+				return nil, false
+			}
+		waitSlot:
+			for {
+				select {
+				case <-s2.turnSlot:
+					if s2.Dead() {
+						s2.turnSlot <- struct{}{} // 别的等待者也要经此发现换代
+						break waitSlot
+					}
+					return s2, true
+				case <-s2.deadCh:
+					break waitSlot // 会话换代，重新 acquire
+				case <-r.Context().Done():
+					return nil, false
+				case <-heartbeat.C:
+					v3EmitThinkingDelta(w, flusher, chatID, created, model,
+						fmt.Sprintf("\n⏳ 同会话上一条消息仍在处理，排队中…（已 %ds）", int(time.Since(reqStart).Seconds())))
+				}
+			}
+		}
+	}
+
+	sess, ok2 := acquireTurn()
+	if !ok2 {
+		return
+	}
+	// turnOwned/releaseOwned 管理令牌归还：正常返回、冷启动换代、give-up 拆会话
+	// 都必须恰好归还一次（归还即放行队列里的下一条同 session 请求）。
+	turnOwned := sess
+	releaseOwned := func() {
+		if turnOwned == nil {
+			return
+		}
+		turnOwned.inTurn.Store(false)
+		turnOwned.markUsed()
+		turnOwned.turnSlot <- struct{}{}
+		turnOwned = nil
+	}
+	defer releaseOwned()
+	sess.inTurn.Store(true)
 
 	// runAttempt drives ONE attempt at this turn on the given (already acquired)
 	// session: Phase 1 waits for the channel to go live, Phase 2 sends the turn
@@ -929,7 +1107,15 @@ func handleChannelV3Response(w http.ResponseWriter, r *http.Request, req *openai
 		// 污染下游 robot_chat_logs 的单条消息用量（B-3）。
 		v3Mgr.flushV3Orphan(sess, "turn-start")
 		log.Printf("[v3] turn start session=%s req=%s model=%s chat=%s", sid, reqID, model, chatID)
-		v3Mgr.enqueue(sid, v3Msg{ReqID: reqID, Content: content})
+		if err := v3Mgr.enqueue(r.Context(), sid, v3Msg{ReqID: reqID, Content: content}); err != nil {
+			if r.Context().Err() != nil {
+				return v3OutcomeClientGone
+			}
+			// inbox 没了（会话正被拆）或卡满（bridge 不 poll）都说明会话已坏，
+			// 按冷启动挂死处理：杀掉重拉。
+			log.Printf("[v3] enqueue failed session=%s req=%s: %v", sid, reqID, err)
+			return v3OutcomeColdHang
+		}
 
 		// streamed: flushed ≥1 content chunk (drives the clean-finish-vs-error
 		// choice on abnormal end). committed: got ANY output, so the cold-start
@@ -1037,7 +1223,13 @@ func handleChannelV3Response(w http.ResponseWriter, r *http.Request, req *openai
 	const maxColdRetries = 1
 	for attempt := 0; ; attempt++ {
 		switch runAttempt(sess) {
-		case v3OutcomeDone, v3OutcomeClientGone:
+		case v3OutcomeDone:
+			return
+		case v3OutcomeClientGone:
+			// turn 串行化下 inbox 里只可能是本请求还没被 bridge 取走的那条消息。
+			// 清掉，否则同 session 的下一轮会先收到这条旧消息——claude 回答一个
+			// 没人等的问题，新问题被压后。
+			v3Mgr.drainInbox(sid)
 			return
 		case v3OutcomeColdHang:
 			if attempt >= maxColdRetries {
@@ -1048,20 +1240,30 @@ func handleChannelV3Response(w http.ResponseWriter, r *http.Request, req *openai
 				usage := v3Mgr.harvestV3Usage(sess, model, false)
 				v3EmitClose(w, flusher, chatID, created, model, "", includeUsage, usage)
 				log.Printf("[v3] cold-start give up after %d retries session=%s req=%s", attempt, sid, reqID)
+				// 冻死的会话不能留在 manager 里：留着的话下一条请求会原样再白等
+				// 一轮 5 分钟 watchdog。拆掉（连同 inbox 与残留消息），下次重拉。
+				// 顺序与重试路径一致：先 kill（标记 dead）再还令牌，这样并发同 sid
+				// 的等待者拿到令牌时会看到 Dead()、回去重 acquire，而不是短暂"赢得"
+				// 一个马上被销毁的会话。
+				if !ephemeral {
+					v3Mgr.killSession(sid)
+					releaseOwned()
+				}
 				return
 			}
 			log.Printf("[v3] cold-start hang → kill+relaunch+retry (attempt %d) session=%s req=%s", attempt+1, sid, reqID)
+			// 先杀再还令牌：排队的等待者拿到令牌会看到 Dead，回到 re-acquire 等
+			// 新会话，不会误占尸体。
 			sess.kill()
+			releaseOwned()
 			v3Mgr.drainInbox(sid)
-			var aerr error
-			sess, aerr = v3Mgr.acquire(sid, p)
-			if aerr != nil {
-				fmt.Fprintf(w, "data: %s\n\n", v3ErrChunk(chatID, created, model, "relaunch failed: "+aerr.Error()))
-				fmt.Fprintf(w, "data: [DONE]\n\n")
-				flusher.Flush()
-				log.Printf("[v3] cold-start relaunch failed session=%s req=%s: %v", sid, reqID, aerr)
-				return
+			var ok3 bool
+			sess, ok3 = acquireTurn()
+			if !ok3 {
+				log.Printf("[v3] cold-start relaunch not acquired session=%s req=%s", sid, reqID)
+				return // 客户端已断开，或 relaunch 失败（acquireTurn 已发 SSE 错误）
 			}
+			turnOwned = sess
 			sess.inTurn.Store(true)
 			v3EmitThinkingDelta(w, flusher, chatID, created, model, "\n⏳ 会话启动异常，正在重启会话重试…")
 		}
