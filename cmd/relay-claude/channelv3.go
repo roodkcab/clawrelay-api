@@ -84,6 +84,17 @@ type v3Session struct {
 	ptyLog    *os.File // optional raw PTY capture for debugging
 
 	bound string // spawn-bound model (for change warnings)
+
+	// Transcript-based usage metering (see v3usage.go). These are only touched
+	// from the turn-owning handler goroutine (V3 runs at most one turn per
+	// session — inTurn semantics), but a small mutex guards them anyway so a
+	// future concurrent reader can't corrupt the offset/dedup state.
+	usageMu        sync.Mutex
+	claudeSID      string              // claude-side session UUID (--session-id) == transcript basename
+	transcriptPath string              // lazily resolved via glob by harvestV3Usage
+	usageOffset    int64               // next transcript read position
+	prevReqIDs     map[string]struct{} // requestIds already counted (cross-window dedup)
+	usageWarned    bool                // "transcript not found" logged once per session
 }
 
 // v3DebugPTY, when true, dumps each session's raw claude TUI to /tmp/v3pty-<sid>.log.
@@ -281,6 +292,110 @@ func (m *v3Manager) drainInbox(sid string) {
 	}
 }
 
+// v3FindTranscript globs for the interactive claude's transcript. The cwd
+// encoding of the project dir is deliberately NOT reimplemented — the session
+// UUID is globally unique, so ~/.claude/projects/*/<uuid>.jsonl matches at most
+// one file.
+func v3FindTranscript(claudeSID string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || claudeSID == "" {
+		return ""
+	}
+	matches, _ := filepath.Glob(filepath.Join(home, ".claude", "projects", "*", claudeSID+".jsonl"))
+	if len(matches) == 0 {
+		return ""
+	}
+	return matches[0]
+}
+
+// harvestV3Usage harvests this turn's token usage at a turn-end point: it
+// lazily locates the transcript (one glob, then cached), reads the incremental
+// window since the previous harvest, records the turn into /v1/stats, and
+// returns the aggregate UsageInfo for the SSE usage chunk.
+//
+// Failure semantics: any failure (transcript not found, read/parse error) →
+// returns nil so the caller emits NO usage chunk and downstream keeps the
+// NULL = "not metered" meaning — a 0 would read as "free request". The request
+// itself is still counted via stats.RecordTurn(model, nil) so /v1/stats request
+// totals stop being blind to V3.
+//
+// graceRetry (used on the normal final-reply path only): if the transcript is
+// missing or the window has no usage yet, wait 1.5s and retry once — the
+// terminal reply can race claude's transcript flush by a moment.
+func (m *v3Manager) harvestV3Usage(s *v3Session, model string, graceRetry bool) *openai.UsageInfo {
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+
+	if s.transcriptPath == "" {
+		p := v3FindTranscript(s.claudeSID)
+		if p == "" && graceRetry {
+			time.Sleep(1500 * time.Millisecond)
+			p = v3FindTranscript(s.claudeSID)
+		}
+		if p == "" {
+			if !s.usageWarned {
+				s.usageWarned = true
+				log.Printf("[v3] usage: transcript not found for claude_sid=%s session=%s — turn not metered", s.claudeSID, s.sid)
+			}
+			stats.RecordTurn(model, nil)
+			return nil
+		}
+		s.transcriptPath = p
+	}
+
+	read := func() (map[string]openai.TokenCounts, error) {
+		perModel, newOff, ids, err := readV3UsageWindow(s.transcriptPath, s.usageOffset, s.prevReqIDs)
+		if err != nil {
+			return nil, err
+		}
+		s.usageOffset = newOff
+		if s.prevReqIDs == nil {
+			s.prevReqIDs = make(map[string]struct{})
+		}
+		for id := range ids {
+			s.prevReqIDs[id] = struct{}{}
+		}
+		return perModel, nil
+	}
+
+	perModel, err := read()
+	if err != nil {
+		log.Printf("[v3] usage: read transcript failed session=%s path=%s: %v — turn not metered", s.sid, s.transcriptPath, err)
+		if os.IsNotExist(err) {
+			s.transcriptPath = "" // vanished (cleanup?) → re-glob next turn
+		}
+		stats.RecordTurn(model, nil)
+		return nil
+	}
+	if len(perModel) == 0 && graceRetry {
+		// Window empty right at final-reply time: give the transcript writer a
+		// moment (write ordering between the reply tool call and the jsonl flush
+		// is not guaranteed), then read the follow-up increment.
+		time.Sleep(1500 * time.Millisecond)
+		if pm2, err2 := read(); err2 == nil {
+			perModel = pm2
+		}
+	}
+
+	if len(perModel) == 0 {
+		// Still count the request so /v1/stats request totals include V3 turns.
+		stats.RecordTurn(model, nil)
+		return nil
+	}
+
+	stats.RecordTurn(model, perModel)
+	var input, output, cacheRead, cacheCreation int
+	for _, c := range perModel {
+		input += c.Input
+		output += c.Output
+		cacheRead += c.CacheRead
+		cacheCreation += c.CacheCreation
+	}
+	log.Printf("[v3] usage session=%s claude_sid=%s models=%d input=%d output=%d cache_read=%d cache_creation=%d",
+		s.sid, s.claudeSID, len(perModel), input, output, cacheRead, cacheCreation)
+	return openai.BuildUsageInfo(input, output, cacheRead, cacheCreation)
+}
+
 // v3TurnOutcome is what one runAttempt() of handleChannelV3Response resolves to.
 type v3TurnOutcome int
 
@@ -366,9 +481,19 @@ func (m *v3Manager) launch(sid string, p v3SpawnParams) (*v3Session, error) {
 		return nil, fmt.Errorf("write .mcp.json: %w", err)
 	}
 
+	// A fresh claude-side session UUID per launch (interactive claude supports
+	// --session-id as a general flag): the transcript lands at
+	// ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl, which harvestV3Usage tails
+	// for token metering. EVERY launch mints a NEW uuid — including a cold-start
+	// relaunch of the same relay sid — because reusing a uuid whose transcript
+	// file already exists would make claude refuse to start or unexpectedly
+	// resume the old conversation. (Relaunch goes acquire→launch→new v3Session,
+	// so the fresh uuid + zeroed usage offset come for free.)
+	claudeSID := newUUID()
 	args := []string{
 		"--dangerously-load-development-channels", "server:relaybridge",
 		"--dangerously-skip-permissions",
+		"--session-id", claudeSID,
 		"--model", p.model,
 	}
 	if p.systemPrompt != "" {
@@ -403,13 +528,15 @@ func (m *v3Manager) launch(sid string, p v3SpawnParams) (*v3Session, error) {
 	}
 
 	s := &v3Session{
-		sid:     sid,
-		cmd:     cmd,
-		ptmx:    ptmx,
-		mcpFile: mcpFile,
-		deadCh:  make(chan struct{}),
-		ready:   make(chan struct{}),
-		bound:   p.model,
+		sid:        sid,
+		cmd:        cmd,
+		ptmx:       ptmx,
+		mcpFile:    mcpFile,
+		deadCh:     make(chan struct{}),
+		ready:      make(chan struct{}),
+		bound:      p.model,
+		claudeSID:  claudeSID,
+		prevReqIDs: make(map[string]struct{}),
 	}
 	if v3DebugPTY {
 		if f, err := os.Create(filepath.Join(os.TempDir(), "v3pty-"+sid+".log")); err == nil {
@@ -429,8 +556,8 @@ func (m *v3Manager) launch(sid string, p v3SpawnParams) (*v3Session, error) {
 		m.onSessionDie(sid)
 	}()
 
-	log.Printf("[v3] launched interactive claude session=%s model=%s pid=%d workdir=%s",
-		sid, p.model, cmd.Process.Pid, p.workingDir)
+	log.Printf("[v3] launched interactive claude session=%s claude_sid=%s model=%s pid=%d workdir=%s",
+		sid, claudeSID, p.model, cmd.Process.Pid, p.workingDir)
 	return s, nil
 }
 
@@ -787,11 +914,14 @@ func handleChannelV3Response(w http.ResponseWriter, r *http.Request, req *openai
 					}
 					continue
 				}
-				v3EmitClose(w, flusher, chatID, created, model, ev.text, includeUsage)
+				// Terminal reply → harvest this turn's transcript usage (with the
+				// grace retry: the reply tool call can race the jsonl flush).
+				usage := v3Mgr.harvestV3Usage(sess, model, true)
+				v3EmitClose(w, flusher, chatID, created, model, ev.text, includeUsage, usage)
 				if ev.text != "" {
 					sessionStore.LogDelta(req.SessionID, ev.text)
 				}
-				sessionStore.LogDone(req.SessionID, nil)
+				sessionStore.LogDone(req.SessionID, usage)
 				log.Printf("[v3] turn end session=%s req=%s streamed=%v finalLen=%d", sid, reqID, streamed, len(ev.text))
 				return v3OutcomeDone
 			case <-heartbeat.C:
@@ -813,14 +943,19 @@ func handleChannelV3Response(w http.ResponseWriter, r *http.Request, req *openai
 					log.Printf("[v3] session died before any output session=%s req=%s", sid, reqID)
 					return v3OutcomeColdHang
 				}
+				var usage *openai.UsageInfo
 				if streamed {
-					v3EmitClose(w, flusher, chatID, created, model, "", includeUsage)
+					// Session died but content already streamed → close cleanly and
+					// still meter what the dead claude wrote to its transcript (no
+					// grace retry: the writer is gone, nothing more will appear).
+					usage = v3Mgr.harvestV3Usage(sess, model, false)
+					v3EmitClose(w, flusher, chatID, created, model, "", includeUsage, usage)
 				} else {
 					fmt.Fprintf(w, "data: %s\n\n", v3ErrChunk(chatID, created, model, "claude session ended"))
 					fmt.Fprintf(w, "data: [DONE]\n\n")
 					flusher.Flush()
 				}
-				sessionStore.LogDone(req.SessionID, nil)
+				sessionStore.LogDone(req.SessionID, usage)
 				log.Printf("[v3] session=%s died mid-turn req=%s streamed=%v", sid, reqID, streamed)
 				return v3OutcomeDone
 			case <-r.Context().Done():
@@ -831,7 +966,10 @@ func handleChannelV3Response(w http.ResponseWriter, r *http.Request, req *openai
 				// ALWAYS surface a visible marker (even mid-stream): never report a
 				// stalled turn as a clean success.
 				v3EmitContentDelta(w, flusher, chatID, created, model, "\n\n⚠️ 任务长时间无新进展，已停止等待。")
-				v3EmitClose(w, flusher, chatID, created, model, "", includeUsage)
+				// Meter whatever the stuck turn actually burned (no grace retry:
+				// nothing has moved for ReplyTotal already).
+				usage := v3Mgr.harvestV3Usage(sess, model, false)
+				v3EmitClose(w, flusher, chatID, created, model, "", includeUsage, usage)
 				log.Printf("[v3] idle timeout (no activity %s) session=%s req=%s streamed=%v", v3Mgr.cfg.ReplyTotal, sid, reqID, streamed)
 				return v3OutcomeDone
 			}
@@ -850,7 +988,11 @@ func handleChannelV3Response(w http.ResponseWriter, r *http.Request, req *openai
 		case v3OutcomeColdHang:
 			if attempt >= maxColdRetries {
 				v3EmitContentDelta(w, flusher, chatID, created, model, "\n\n⚠️ 会话启动多次无响应，请稍后重发。")
-				v3EmitClose(w, flusher, chatID, created, model, "", includeUsage)
+				// sess here is the CURRENT (post-retry) session object; a frozen
+				// cold start usually has an empty transcript, so this mostly just
+				// records the request into /v1/stats (usage stays nil → NULL).
+				usage := v3Mgr.harvestV3Usage(sess, model, false)
+				v3EmitClose(w, flusher, chatID, created, model, "", includeUsage, usage)
 				log.Printf("[v3] cold-start give up after %d retries session=%s req=%s", attempt, sid, reqID)
 				return
 			}
@@ -910,7 +1052,12 @@ func v3EmitContentDelta(w http.ResponseWriter, flusher http.Flusher, chatID stri
 // reply_chunk, finalText is the last remaining piece (often empty) and the
 // earlier deltas have already gone out; when not streamed, finalText is the
 // whole answer (the legacy single-chunk behavior).
-func v3EmitClose(w http.ResponseWriter, flusher http.Flusher, chatID string, created int64, model, finalText string, includeUsage bool) {
+//
+// usage is the transcript-harvested aggregate (harvestV3Usage). Non-nil (and
+// includeUsage) → a usage chunk goes out between the finish chunk and [DONE];
+// nil → NO usage chunk, so downstream stores NULL ("not metered"), never a
+// fake 0 ("free request").
+func v3EmitClose(w http.ResponseWriter, flusher http.Flusher, chatID string, created int64, model, finalText string, includeUsage bool, usage *openai.UsageInfo) {
 	if finalText != "" {
 		chunk := openai.ChatCompletionResponse{
 			ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
@@ -928,9 +1075,15 @@ func v3EmitClose(w http.ResponseWriter, flusher http.Flusher, chatID string, cre
 	data, _ := json.Marshal(fin)
 	fmt.Fprintf(w, "data: %s\n\n", data)
 
-	// V3 has no token source (interactive PTY, no stream-json). Emit NO usage
-	// chunk so downstream stores NULL ("not metered"), not 0 ("free request").
-	_ = includeUsage
+	if includeUsage && usage != nil {
+		uc := openai.ChatCompletionResponse{
+			ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
+			Choices: []openai.ChatCompletionChoice{},
+			Usage:   usage,
+		}
+		data, _ := json.Marshal(uc)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+	}
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }
