@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -24,7 +25,7 @@ import (
 	"clawrelay-api/pkg/sessions"
 )
 
-var version = "2.0.3"
+var version = "2.1.0"
 
 // buildCommit is stamped at build time via:
 //
@@ -106,8 +107,18 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cap the body before ReadAll: without a limit a single oversized (or
+	// malicious) request would be buffered whole into memory. 64 MiB leaves
+	// ample headroom for base64-embedded attachments.
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<20)
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			openai.WriteError(w, http.StatusRequestEntityTooLarge, "invalid_request_error",
+				fmt.Sprintf("Request body exceeds the %d byte limit", maxErr.Limit))
+			return
+		}
 		openai.WriteError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("Failed to read body: %v", err))
 		return
 	}
@@ -165,9 +176,14 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	// Falling through to V1 in channel mode with a session_id (a non-stream
 	// or tool-bearing request): a live channel worker may be holding that
 	// session's jsonl open. Drop it first so the V1 `claude --resume` below
-	// can't write the same session concurrently.
+	// can't write the same session concurrently. drop 会等 worker 当前 turn
+	// 结束才杀（绝不杀断正在流式输出的轮）；等不到就拒绝本次 fall-through。
 	if relayMode == "channel" && channelMgr != nil && req.SessionID != "" {
-		channelMgr.drop(req.SessionID)
+		if err := channelMgr.drop(r.Context(), req.SessionID); err != nil {
+			log.Printf("channel drop failed session=%s: %v", req.SessionID, err)
+			openai.WriteError(w, http.StatusServiceUnavailable, "server_error", "session busy in channel mode; retry later")
+			return
+		}
 	}
 
 	var sessionDir string

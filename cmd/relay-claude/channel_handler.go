@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -23,6 +24,55 @@ import (
 // the backstop kill — and even then its session is on disk, so the next request
 // --resumes it. Overridable in tests.
 var channelInterruptBackstop = 90 * time.Second
+
+// channelQueuedPingInterval is how often a request queued behind another turn
+// on the same session emits a `: queued` SSE comment. 上游 wuji_tools 的
+// sock_read=120s 只看字节到达；排队期间必须持续有字节流出，连接才不会被掐。
+// Overridable in tests.
+var channelQueuedPingInterval = 15 * time.Second
+
+// channelEmitErrClose ends an ALREADY-STARTED SSE stream with a visible error:
+// SSE 头一旦发出（handleChannelStreamResponse 把它提前到了 acquire 之前），
+// openai.WriteError 的状态码就写不进去了，只能以 content delta + finish +
+// [DONE] 收尾，让上游把错误当普通回复展示，而不是挂死等一个永远不来的 [DONE]。
+func channelEmitErrClose(w http.ResponseWriter, flusher http.Flusher, chatID string, created int64, model, msg string) {
+	chunk := openai.ChatCompletionResponse{
+		ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
+		Choices: []openai.ChatCompletionChoice{{Index: 0, Delta: openai.NewChatMessage("assistant", "⚠️ "+msg)}},
+	}
+	data, _ := json.Marshal(chunk)
+	fmt.Fprintf(w, "data: %s\n\n", data)
+
+	finish := "stop"
+	fin := openai.ChatCompletionResponse{
+		ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
+		Choices: []openai.ChatCompletionChoice{{Index: 0, Delta: openai.NewChatMessage("", ""), FinishReason: &finish}},
+	}
+	data, _ = json.Marshal(fin)
+	fmt.Fprintf(w, "data: %s\n\n", data)
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+// lockTurnWithQueuedPings ctx 感知地等 worker 的 turnMu，等待期间周期性写
+// `: queued` SSE 注释——注释行对 OpenAI 客户端不可见，不污染回复，但让上游代理
+// 看到连接还活着、请求只是在排队。拿到锁返回 nil；ctx 先取消返回错误（锁由
+// lockTurn 内部归还，不泄漏）。
+func lockTurnWithQueuedPings(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, worker *chanWorker) error {
+	done := make(chan error, 1)
+	go func() { done <- worker.lockTurn(ctx) }()
+	tick := time.NewTicker(channelQueuedPingInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case err := <-done:
+			return err
+		case <-tick.C:
+			fmt.Fprintf(w, ": queued\n\n")
+			flusher.Flush()
+		}
+	}
+}
 
 // buildChannelArgs assembles the claude flags for a persistent stream-json
 // process. The trailing session flag (--session-id / --resume) is appended by
@@ -394,23 +444,52 @@ func handleChannelStreamResponse(w http.ResponseWriter, r *http.Request, req *op
 		model:        model,
 	}
 
+	// SSE 头 + 首个 ping 在 acquire/等锁之前就发出去：同 session 的排队请求会
+	// 阻塞在 turnMu 上，期间一个字节都不发的话，上游 wuji_tools 的 sock_read
+	//（120s）会把还没轮到的连接掐掉。头发出去之后，下面所有错误路径都只能以
+	// SSE 块收尾（channelEmitErrClose），WriteError 的状态码已经写不进去了。
+	flusher, isFlusher := w.(http.Flusher)
+	if !isFlusher {
+		log.Printf("[channel] streaming not supported session=%s", sessionID)
+		openai.WriteError(w, http.StatusInternalServerError, "server_error", "streaming unsupported by this connection")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, ": ping\n\n")
+	flusher.Flush()
+
 	worker, err := channelMgr.acquire(r.Context(), sessionID, p)
 	if err != nil {
 		log.Printf("[channel] acquire failed session=%s: %v", sessionID, err)
-		openai.WriteError(w, http.StatusInternalServerError, "server_error", err.Error())
+		channelEmitErrClose(w, flusher, chatID, created, model, err.Error())
 		return
 	}
 
-	lines, err := worker.beginTurn(content)
+	// ctx 感知地排队等 turnMu（期间发 `: queued` 注释保活）：客户端已断开的
+	// 排队请求立刻放弃，消息不再注入 claude——否则它会进会话历史、随即被
+	// interrupt，"进了历史但没被回答"。
+	if err := lockTurnWithQueuedPings(r.Context(), w, flusher, worker); err != nil {
+		// 客户端已经走了，没有对象可以收错误块；只留日志。
+		log.Printf("[channel] queued request gave up session=%s: %v", sessionID, err)
+		return
+	}
+
+	lines, err := worker.beginTurnLocked(content)
 	if err != nil {
 		// Worker died between acquire and beginTurn (e.g. reaped). One retry
 		// with a fresh acquire (which will spawn/resume).
 		log.Printf("[channel] beginTurn failed session=%s: %v; retrying acquire", sessionID, err)
 		if worker, err = channelMgr.acquire(r.Context(), sessionID, p); err == nil {
-			lines, err = worker.beginTurn(content)
+			if err = worker.lockTurn(r.Context()); err == nil {
+				lines, err = worker.beginTurnLocked(content)
+			}
 		}
 		if err != nil {
-			openai.WriteError(w, http.StatusInternalServerError, "server_error", err.Error())
+			channelEmitErrClose(w, flusher, chatID, created, model, err.Error())
 			return
 		}
 	}
@@ -442,9 +521,16 @@ func handleChannelStreamResponse(w http.ResponseWriter, r *http.Request, req *op
 		// stuck turn — claude's interrupt for in-progress text lands at the next
 		// message boundary, so normal turns finish well within the window and
 		// their hot process is preserved.
+		//
+		// Scope the backstop to THIS turn (turnSeq): if this interrupted turn
+		// drains right at the backstop boundary and the next queued request has
+		// already taken the worker, killTurnSeq is a no-op instead of SIGKILLing
+		// that innocent successor mid-stream.
+		turnSeq := worker.turnSeqNow()
 		timer := time.AfterFunc(channelInterruptBackstop, func() {
-			log.Printf("[channel] interrupt backstop fired session=%s; killing worker", sessionID)
-			worker.kill()
+			if worker.killTurnSeq(turnSeq) {
+				log.Printf("[channel] interrupt backstop fired session=%s; killed stuck turn", sessionID)
+			}
 		})
 		go func() {
 			for {
@@ -488,22 +574,6 @@ func handleChannelStreamResponse(w http.ResponseWriter, r *http.Request, req *op
 			worker.endTurn()
 		}
 	}()
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-
-	flusher, isFlusher := w.(http.Flusher)
-	if !isFlusher {
-		log.Printf("[channel] streaming not supported; interrupting + releasing")
-		releaseInBackground("not_flushable")
-		return
-	}
-
-	fmt.Fprintf(w, ": ping\n\n")
-	flusher.Flush()
 
 	heartbeat := time.NewTicker(30 * time.Second)
 	defer heartbeat.Stop()

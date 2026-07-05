@@ -55,6 +55,7 @@ type chanWorker struct {
 
 	sessionID atomic.Value // string, captured from the init/system event
 	dead      atomic.Bool
+	reaped    atomic.Bool  // cmd.Wait() 已返回：进程已被收割，PID 随时可能被复用
 	lastUsed  atomic.Int64 // unix nanos
 	spawnedAt time.Time
 	usedFlag  string // "--session-id" or "--resume" actually used at spawn
@@ -75,8 +76,9 @@ type chanWorker struct {
 	turnMu sync.Mutex  // held by the handler for the whole duration of a turn
 	inTurn atomic.Bool // true while a turn is actively streaming (reap/evict must skip it)
 
-	curMu sync.Mutex
-	cur   *activeTurn // current turn's channels; nil between turns
+	curMu   sync.Mutex
+	cur     *activeTurn // current turn's channels; nil between turns
+	turnSeq uint64      // bumped each beginTurnLocked; identifies the current turn (guarded by curMu)
 
 	// meter diffs this persistent process's cumulative result.usage into
 	// per-turn deltas. Its lifetime == the process's, so a respawned worker
@@ -112,12 +114,16 @@ func (w *chanWorker) startupErrMarker() string {
 	return s
 }
 
+// claudeBin is the executable spawned for channel workers. Overridable in
+// tests (a stub shell stands in for claude).
+var claudeBin = "claude"
+
 // spawnChanWorker starts a persistent claude process. The caller must then
 // waitStartup() to learn whether the chosen --session-id/--resume flag was
 // accepted. onDie fires once when the process exits (used by the manager to
 // drop the worker from its registry).
 func spawnChanWorker(key string, args []string, workdir string, envVars map[string]string, usedFlag string, onDie func()) (*chanWorker, error) {
-	cmd := exec.Command("claude", args...)
+	cmd := exec.Command(claudeBin, args...)
 	proc.SetNewProcessGroup(cmd)
 	cmd.Env = cleanEnv(envVars)
 	if workdir != "" {
@@ -153,15 +159,32 @@ func spawnChanWorker(key string, args []string, workdir string, envVars map[stri
 	}
 	w.markUsed()
 
-	go w.drainStdout(stdout)
-	go w.drainStderr(stderr)
+	// os/exec 约定：Wait 在返回前会关闭 StdoutPipe/StderrPipe。若与 reader 并发
+	// 调用，reader 尚未读走的管道缓冲会被截断——interrupt 后最关键的、带该轮真实
+	// usage 的 result 行恰好最容易还躺在缓冲里。所以必须等两个 drain goroutine
+	// 全部退出后才 Wait。
+	//
+	// 死锁分析（为什么 readersDone 必然归零）：drainStdout 可能 park 在
+	// `a.lines <- line` 上，但每个 turn 有且只有一个消费方持续消费 lines 直到
+	// 关闭（前台 handler / interrupt 后 releaseInBackground 的后台 drainer /
+	// ephemeral 的 finish drainer）；而 kill() 会 abandonActiveTurn 唤醒 park 的
+	// send。两条路都通向 drainStdout 退出，Wait 不会被永久推迟。
+	var readersDone sync.WaitGroup
+	readersDone.Add(2)
+	go func() { defer readersDone.Done(); w.drainStdout(stdout) }()
+	go func() { defer readersDone.Done(); w.drainStderr(stderr) }()
 	go func() {
+		readersDone.Wait()
 		_ = cmd.Wait()
+		// Wait 已收割进程：PID 随时可能被系统复用，此后 kill() 不得再对 -pid
+		// 发信号（见 kill 的 reaped 防护）。
+		w.reaped.Store(true)
 		w.dead.Store(true)
 		_ = stdin.Close()
 		close(w.deadCh)
-		// Unblock any handler still ranging over the current turn channel: wake
-		// a possibly-parked drainStdout send so it closes `lines` itself.
+		// 防御 beginTurn 的窗口期：drainStdout 已退出但 deadCh 还没关时，
+		// beginTurn 可能刚装上一个没人会去关闭 lines 的新 turn。abandon 它，
+		// 消费方（handler / 后台 drainer）由 deadCh 分支收尾。
 		w.abandonActiveTurn(nil)
 		if onDie != nil {
 			onDie()
@@ -245,6 +268,16 @@ func (w *chanWorker) drainStdout(r io.Reader) {
 			w.completeActiveTurn(a)
 		}
 	}
+	if err := sc.Err(); err != nil {
+		// Scan 出错（单行超过 8MB 上限、读错误）时进程多半还活着：claude 会阻塞
+		// 在写满的 stdout 管道上，而这里已无人再读。静默退出会留下僵尸 worker——
+		// 后续请求 beginTurn 的 dead 检查全过、写 stdin 成功，却永远等不到回复。
+		// 杀掉进程组解除管道阻塞，让 Wait goroutine 走正常收尸路径（deadCh 关
+		// 闭、onDie 摘除注册表）。
+		log.Printf("[channel:%s] stdout scan error: %v; killing worker", w.key, err)
+		w.dead.Store(true)
+		proc.KillGroup(w.cmd)
+	}
 }
 
 func (w *chanWorker) drainStderr(r io.Reader) {
@@ -259,6 +292,10 @@ func (w *chanWorker) drainStderr(r io.Reader) {
 		case strings.Contains(line, "No conversation found with session ID"):
 			w.startupErr.Store("no_conversation")
 		}
+	}
+	if err := sc.Err(); err != nil {
+		// stderr 读挂了不代表进程坏死（stdout 才是命脉），只留观测痕迹。
+		log.Printf("[channel:%s/stderr] scan error: %v", w.key, err)
 	}
 }
 
@@ -293,11 +330,41 @@ func (w *chanWorker) waitStartup(window time.Duration) startupOutcome {
 	}
 }
 
+// lockTurn 以 ctx 感知的方式获取 turnMu。同 session 的排队请求会在这里等前一个
+// turn 结束；等待期间客户端可能已断开（上游 sock_read 超时/用户取消），此时绝不
+// 能再把消息注入 claude——消息会进会话历史却立刻被 interrupt，"进了历史但没被
+// 回答"。ctx 先取消时返回错误；内部 goroutine 迟早会拿到锁，到手后立刻归还，
+// 一次取消不会把 turnMu 永久锁死。
+func (w *chanWorker) lockTurn(ctx context.Context) error {
+	acquired := make(chan struct{})
+	go func() {
+		w.turnMu.Lock()
+		close(acquired)
+	}()
+	select {
+	case <-acquired:
+		return nil
+	case <-ctx.Done():
+		go func() {
+			<-acquired
+			w.turnMu.Unlock()
+		}()
+		return fmt.Errorf("waiting for turn lock: %w", ctx.Err())
+	}
+}
+
 // beginTurn acquires the worker exclusively, writes the new user message, and
 // returns the channel of stdout lines for this turn (closed after the turn's
 // `result`, or when the process dies). The caller MUST call endTurn when done.
 func (w *chanWorker) beginTurn(content string) (<-chan string, error) {
 	w.turnMu.Lock()
+	return w.beginTurnLocked(content)
+}
+
+// beginTurnLocked is beginTurn minus the Lock: the caller already holds turnMu
+// (via lockTurn or a direct Lock). 错误路径语义与 beginTurn 一致：出错时内部
+// Unlock，调用方无需（也不能）再释放。
+func (w *chanWorker) beginTurnLocked(content string) (<-chan string, error) {
 	if w.dead.Load() {
 		w.turnMu.Unlock()
 		return nil, errWorkerDead
@@ -305,6 +372,7 @@ func (w *chanWorker) beginTurn(content string) (<-chan string, error) {
 	a := &activeTurn{lines: make(chan string, 256), quit: make(chan struct{})}
 	w.curMu.Lock()
 	w.cur = a
+	w.turnSeq++
 	w.curMu.Unlock()
 	w.inTurn.Store(true)
 
@@ -374,7 +442,49 @@ func (w *chanWorker) interrupt() error {
 func (w *chanWorker) kill() {
 	w.dead.Store(true)
 	w.abandonActiveTurn(nil)
+	// 进程一旦被 cmd.Wait() 收割，其 PID 可能已被系统复用；此时再对 -pid 发
+	// SIGKILL 会误杀无关进程组（同 pkg/proc.WatchDisconnect 的警告）。已收割
+	// 则跳过信号——dead 标记与 turn 释放语义在上面已经完成。
+	if w.reaped.Load() {
+		return
+	}
 	proc.KillGroup(w.cmd)
+}
+
+// turnSeqNow returns the sequence of the turn currently owning the worker. The
+// caller (holding turnMu for its turn) captures this so a later backstop can
+// tell whether its turn is still the active one.
+func (w *chanWorker) turnSeqNow() uint64 {
+	w.curMu.Lock()
+	defer w.curMu.Unlock()
+	return w.turnSeq
+}
+
+// killTurnSeq kills the worker ONLY if seq is still the active turn — the
+// interrupt backstop uses it so a timer armed for turn T1 can never SIGKILL the
+// process mid-stream of a later turn T2 on the same (reused) worker. The
+// compare-and-claim runs under curMu: if turnSeq still matches and cur!=nil,
+// T1's endTurn has not run yet, so it still holds turnMu and T2 provably has not
+// started — killing is correct (T1 is the genuinely stuck turn). If seq has
+// advanced, T1 already ended; do nothing. Inlines the abandon so it holds curMu
+// across the whole decision (abandonActiveTurn would re-lock curMu).
+func (w *chanWorker) killTurnSeq(seq uint64) bool {
+	w.curMu.Lock()
+	if w.turnSeq != seq || w.cur == nil {
+		w.curMu.Unlock()
+		return false
+	}
+	a := w.cur
+	w.cur = nil
+	w.dead.Store(true)
+	reaped := w.reaped.Load()
+	w.curMu.Unlock()
+
+	a.abandon() // wake a parked drainStdout send so it closes lines → drainer endTurn
+	if !reaped {
+		proc.KillGroup(w.cmd)
+	}
+	return true
 }
 
 // ---- manager ----
@@ -430,15 +540,30 @@ func (m *chanManager) untrackInflight(w *chanWorker) {
 // drop kills and removes the persistent worker for sessionID, if any. Used
 // before a same-session request that must fall through to the legacy
 // `claude --resume` path, so the two never write the session jsonl at once.
-func (m *chanManager) drop(sessionID string) {
+// 必须先 ctx 感知地拿到 turnMu 才能杀：worker 可能正在给另一个请求流式输出，
+// 无视 inTurn 直接 kill 会把活跃 turn 当场杀断。等不到锁（ctx 先取消）时返回
+// 错误且 worker 不受影响，由调用方拒绝本次 fall-through。
+func (m *chanManager) drop(ctx context.Context, sessionID string) error {
 	m.mu.Lock()
 	w := m.workers[sessionID]
-	delete(m.workers, sessionID)
 	m.mu.Unlock()
-	if w != nil {
-		log.Printf("[channel] dropping worker session=%s (legacy fall-through for same session)", sessionID)
-		w.kill()
+	if w == nil {
+		return nil
 	}
+	if err := w.lockTurn(ctx); err != nil {
+		return fmt.Errorf("drop session %s: %w", sessionID, err)
+	}
+	// 拿到锁之后才从注册表摘除：等锁失败的 worker 必须留在注册表里，否则它
+	// 就成了 reaper 摸不到的孤儿进程。等锁期间它可能已死亡重生，只摘同一个。
+	m.mu.Lock()
+	if m.workers[sessionID] == w {
+		delete(m.workers, sessionID)
+	}
+	m.mu.Unlock()
+	log.Printf("[channel] dropping worker session=%s (legacy fall-through for same session)", sessionID)
+	w.kill()
+	w.turnMu.Unlock()
+	return nil
 }
 
 // StartReaper kills workers idle longer than IdleTTL until ctx is cancelled.
