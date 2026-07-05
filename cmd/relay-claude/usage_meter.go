@@ -40,9 +40,10 @@ func (identityMeter) perTurn(cur usageSnapshot) usageSnapshot { return cur }
 //   - result 的 bare usage 字段是【per-turn 值】（不是累计）；
 //   - 两种 shape 会在同一进程内交替出现（例如无工具的简短轮只给 bare usage）。
 //
-// 因此 token 基线（modelBase）只跟踪 fromModelUsage=true 的流；bare 轮直接取原
-// 值、不动基线 —— 旧实现把 shape 翻转当 reset、把翻回来的累计值整段当全量，
-// 一轮就能虚报几万 cache token，这是本次重写要杀死的 bug。
+// 因此 token 基线（modelBase）只跟踪 fromModelUsage=true 的流；bare 轮直接取
+// 原值入账，并把该值垫进 modelBase（modelUsage 累计包含 bare 轮，垫高基线才能
+// 让下一次差分自然扣除，否则 bare 轮被双计）—— 旧实现把 shape 翻转当 reset、
+// 把翻回来的累计值整段当全量，一轮就能虚报几万 cache token。
 type cumulativeMeter struct {
 	mu           sync.Mutex
 	lastCost     float64
@@ -73,12 +74,18 @@ func (m *cumulativeMeter) perTurn(cur usageSnapshot) usageSnapshot {
 	m.lastCost = cur.costUSD
 
 	if !cur.fromModelUsage {
-		// bare usage 视为 per-turn 值（基于 2.1.199 实证），直接采用，不动
-		// modelBase。代价：bare 间奏轮的 token 会被下一次 modelUsage 差分重复
-		// 覆盖（modelUsage 累计包含了这轮），量级可忽略；换来 shape 翻转时不再
-		// 把整段累计当全量记账。
+		// bare usage 视为 per-turn 值（基于 2.1.199 实证），直接采用。但
+		// modelUsage 的进程级累计【包含】这一轮的消耗，所以必须把 bare 值加进
+		// modelBase 垫高基线——否则下一次 modelUsage 差分会把 bare 轮整段再记
+		// 一遍（bare 轮同样携带数万级 cache_read，双计不是可忽略量级）。
 		d.input, d.output = cur.input, cur.output
 		d.cacheCreation, d.cacheRead = cur.cacheCreation, cur.cacheRead
+		if m.hasModelBase {
+			m.modelBase.input += cur.input
+			m.modelBase.output += cur.output
+			m.modelBase.cacheCreation += cur.cacheCreation
+			m.modelBase.cacheRead += cur.cacheRead
+		}
 		return d
 	}
 
@@ -118,6 +125,9 @@ func recordInterruptedTurnUsage(meter usageMeter, line, model string) {
 	}
 	eu := effectiveUsage(&event)
 	if eu == nil {
+		// result 无任何 usage：请求数仍要入账，与 V3 的 RecordTurn(model, nil)
+		// 口径一致，否则中断场景 total_requests 系统性偏低。
+		stats.RecordTurn(model, nil)
 		return
 	}
 	d := cm.perTurn(usageSnapshot{
@@ -132,5 +142,8 @@ func recordInterruptedTurnUsage(meter usageMeter, line, model string) {
 		stats.Record(model, d.input, d.output, d.cacheCreation, d.cacheRead, d.costUSD)
 		log.Printf("[channel] interrupted-turn usage recorded: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f",
 			model, d.input, d.output, d.cacheRead, d.cacheCreation, d.costUSD)
+	} else {
+		// 零增量中断轮（interrupt 落在任何 API 消耗之前）：只计请求数。
+		stats.RecordTurn(model, nil)
 	}
 }

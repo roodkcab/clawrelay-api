@@ -170,6 +170,10 @@ func TestIsStaleThreadErr(t *testing.T) {
 		{"session expired", true},
 		{"rate limit exceeded, retry later", false},
 		{"stream error: connection reset", false},
+		// 单凭名词命中不删绑定（C2 收紧）：panic/限流文本含 thread/session 但
+		// 线程仍有效，Forget 会把瞬态故障放大成整会话上下文丢失。
+		{"thread 'tokio-runtime-worker' panicked at src/main.rs", false},
+		{"usage limit reached for this session", false},
 		{"", false},
 	}
 	for _, c := range cases {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http/httptest"
@@ -300,7 +301,7 @@ func TestManagerReusesLiveWorker(t *testing.T) {
 	w := newWorkerAt("s1", time.Now())
 	m.workers["s1"] = w
 
-	got, err := m.acquire("s1", spawnParams{})
+	got, err := m.acquire(context.Background(), "s1", spawnParams{})
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -604,7 +605,7 @@ func TestAcquireWaitsForInflightSpawn(t *testing.T) {
 	}
 	got := make(chan result, 1)
 	go func() {
-		w, err := m.acquire("s1", spawnParams{})
+		w, err := m.acquire(context.Background(), "s1", spawnParams{})
 		got <- result{w, err}
 	}()
 

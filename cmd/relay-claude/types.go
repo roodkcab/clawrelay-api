@@ -91,6 +91,7 @@ func perModelCounts(ev *claudeEvent, fallbackModel string) map[string]openai.Tok
 	}
 	if len(ev.ModelUsage) > 0 {
 		out := make(map[string]openai.TokenCounts, len(ev.ModelUsage))
+		var costSum float64
 		for model, mu := range ev.ModelUsage {
 			out[model] = openai.TokenCounts{
 				Input:         mu.InputTokens,
@@ -99,6 +100,14 @@ func perModelCounts(ev *claudeEvent, fallbackModel string) map[string]openai.Tok
 				CacheRead:     mu.CacheReadInputTokens,
 				CostUSD:       mu.CostUSD,
 			}
+			costSum += mu.CostUSD
+		}
+		// 兜底：某些 CLI 版本的 modelUsage 条目不带 costUSD——不能让成本静默
+		// 归零，把顶层 total_cost_usd 归到 fallbackModel 名下。
+		if costSum == 0 && ev.TotalCostUSD > 0 {
+			fc := out[fallbackModel]
+			fc.CostUSD = ev.TotalCostUSD
+			out[fallbackModel] = fc
 		}
 		return out
 	}

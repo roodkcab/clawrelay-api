@@ -501,10 +501,15 @@ type spawnParams struct {
 // and retries with the opposite flag if claude rejects the first choice.
 // Spawning is single-flighted per session (A8): concurrent requests that miss
 // the registry wait for the in-progress spawn and re-check, instead of racing
-// a second process onto the same session.
-func (m *chanManager) acquire(sessionID string, p spawnParams) (*chanWorker, error) {
+// a second process onto the same session. ctx bounds the wait: a disconnected
+// client must not queue up behind a failing spawn chain, become the next
+// spawner and burn a turn nobody is listening to.
+func (m *chanManager) acquire(ctx context.Context, sessionID string, p spawnParams) (*chanWorker, error) {
 	var spawnCh chan struct{}
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("acquire session %s: %w", sessionID, err)
+		}
 		m.mu.Lock()
 		if w, ok := m.workers[sessionID]; ok && !w.Dead() {
 			w.markUsed()
@@ -524,7 +529,11 @@ func (m *chanManager) acquire(sessionID string, p spawnParams) (*chanWorker, err
 			// for it and re-check (it may have promoted a live worker, or
 			// failed — in which case this request becomes the next spawner).
 			m.mu.Unlock()
-			<-ch
+			select {
+			case <-ch:
+			case <-ctx.Done():
+				return nil, fmt.Errorf("acquire session %s: %w", sessionID, ctx.Err())
+			}
 			continue
 		}
 		spawnCh = make(chan struct{})

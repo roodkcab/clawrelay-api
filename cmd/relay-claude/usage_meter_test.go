@@ -57,17 +57,19 @@ func TestCumulativeMeterShapeFlipDoesNotDoubleCount(t *testing.T) {
 		t.Fatalf("T1 delta = %+v, want full modelUsage values", d1)
 	}
 
-	// T2: bare {10,38,0,0}（简短间奏轮）→ per-turn 原值，不动 modelUsage 基线。
+	// T2: bare {10,38,0,0}（简短间奏轮）→ per-turn 原值，同时垫高 modelUsage 基线
+	// （modelUsage 累计包含 bare 轮，垫高后下一次差分自然扣除，bare 轮不双计）。
 	d2 := m.perTurn(usageSnapshot{input: 10, output: 38, costUSD: 0.12, fromModelUsage: false})
 	if d2.input != 10 || d2.output != 38 || d2.cacheRead != 0 || d2.cacheCreation != 0 {
 		t.Fatalf("T2 delta = %+v, want the bare per-turn values {10,38,0,0}", d2)
 	}
 
-	// T3: modelUsage 累计 {1100,1100,66573,8100} → 只记 T3-T1 差分，
-	// 绝不能把 T3 整段当全量（旧 bug 一轮虚报 ~5 万 cache token）。
+	// T3: modelUsage 累计 {1100,1100,66573,8100} → 记 T3-(T1+T2) 差分：
+	// 既不能把 T3 整段当全量（旧 bug 一轮虚报 ~5 万 cache token），也不能只减
+	// T1（那样 T2 的 bare 值会被第二次入账）。
 	d3 := m.perTurn(usageSnapshot{input: 1100, output: 1100, cacheRead: 66573, cacheCreation: 8100, costUSD: 0.30, fromModelUsage: true})
-	if d3.input != 558 || d3.output != 584 || d3.cacheRead != 49416 || d3.cacheCreation != 537 {
-		t.Fatalf("T3 delta = %+v, want T3-T1 diff {558,584,49416,537}", d3)
+	if d3.input != 548 || d3.output != 546 || d3.cacheRead != 49416 || d3.cacheCreation != 537 {
+		t.Fatalf("T3 delta = %+v, want T3-(T1+T2) diff {548,546,49416,537}", d3)
 	}
 
 	// cost 全程全局差分：0.10 → 0.02 → 0.18。
@@ -153,16 +155,20 @@ func TestRecordInterruptedTurnUsageIgnoresNonResult(t *testing.T) {
 	}
 }
 
-func TestRecordInterruptedTurnUsageZeroDeltaSkipsStats(t *testing.T) {
+func TestRecordInterruptedTurnUsageZeroDeltaCountsRequestOnly(t *testing.T) {
 	const model = "test-interrupted-zerodelta"
 	m := &cumulativeMeter{}
-	// 基线推进到与残余 result 相同的累计值 → 差分全 0，不应记账。
+	// 基线推进到与残余 result 相同的累计值 → 差分全 0：token 不入账，但该 HTTP
+	// 请求仍要计数（与 V3 的 RecordTurn(model, nil) 口径一致）。
 	m.perTurn(usageSnapshot{input: 500, output: 300, costUSD: 0.10, fromModelUsage: true})
 	reqBefore, totalBefore, _ := statsModelRow(model)
 	recordInterruptedTurnUsage(m, `{"type":"result","modelUsage":{"claude-x":{"inputTokens":500,"outputTokens":300}},"total_cost_usd":0.10}`, model)
 	reqAfter, totalAfter, _ := statsModelRow(model)
-	if reqAfter != reqBefore || totalAfter != totalBefore {
-		t.Fatal("all-zero delta must not be recorded into stats")
+	if reqAfter != reqBefore+1 {
+		t.Fatalf("zero-delta interrupted turn must still count the request: req %d -> %d", reqBefore, reqAfter)
+	}
+	if totalAfter != totalBefore {
+		t.Fatal("all-zero delta must not add tokens into stats")
 	}
 }
 

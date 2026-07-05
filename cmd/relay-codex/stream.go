@@ -60,6 +60,12 @@ probe:
 			}
 			// Zero stdout output: codex died before emitting anything.
 			werr := waitErr()
+			if r.Context().Err() != nil {
+				// 断连竞态：零输出可能是连接取消连带杀进程所致，不是死线程
+				// 签名 —— 不 Forget、不重试。
+				log.Printf("[CODEX] no output + client already gone; not retrying session_id=%s", sessionID)
+				return
+			}
 			if input.IsResume && rebuildFresh != nil && attempt == 0 {
 				log.Printf("[CODEX] resume produced no output (exit err: %v) — forgetting stale thread for session_id=%s, retrying as fresh session", werr, sessionID)
 				input = rebuildFresh()
@@ -421,12 +427,22 @@ func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, input codex
 		}
 
 		// Zero parseable output: same dead-thread signature as the stream
-		// path (codex exit=1, stdout empty, error only on stderr).
+		// path (codex exit=1, stdout empty, error only on stderr). BUT a client
+		// disconnect produces the SAME signature via WatchDisconnect's
+		// KillGroup — that must NOT forget a valid binding nor relaunch an
+		// unwatched orphan run (CODEX review C1).
 		werr := waitErr()
+		if r.Context().Err() != nil {
+			log.Printf("[CODEX] no output because client disconnected (non-stream); not retrying session_id=%s", sessionID)
+			return
+		}
 		if input.IsResume && rebuildFresh != nil && attempt == 0 {
 			log.Printf("[CODEX] resume produced no output (exit err: %v) — forgetting stale thread for session_id=%s, retrying as fresh session (non-stream)", werr, sessionID)
 			input = rebuildFresh()
 			log.Printf("codex retry args: %v (stdin %d bytes)", input.Args, len(input.Stdin))
+			// 旧进程已被 cmd.Wait 回收：重建窗口（附件解码+fork，可达几十 ms）内
+			// 若断连，WatchDisconnect 不能对可能已复用的旧 PID 发信号。
+			cmd = nil
 			cmd2, lines2, waitErr2, lerr := launchCodex(input, workingDir, envVars)
 			if lerr != nil {
 				openai.WriteError(w, http.StatusInternalServerError, "server_error", lerr.Error())
@@ -483,9 +499,22 @@ func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, input codex
 // ("session" kept for older/other builds).
 func isStaleThreadErr(errMsg string) bool {
 	m := strings.ToLower(errMsg)
-	return strings.Contains(m, "session") ||
-		strings.Contains(m, "thread") ||
-		strings.Contains(m, "rollout")
+	// 主签名（实证）："no rollout found for thread id ..."
+	if strings.Contains(m, "no rollout found") {
+		return true
+	}
+	// 其余必须是「对象 + 不存在」的组合才算：单凭名词命中就 Forget 的话，
+	// Rust panic 文本（"thread '...' panicked"）、限流提示（"usage limit
+	// reached for this session"）这类瞬态错误会误删有效绑定，把可自愈故障
+	// 放大成不可逆的整会话上下文丢失。
+	gone := strings.Contains(m, "not found") ||
+		strings.Contains(m, "no longer exists") ||
+		strings.Contains(m, "does not exist") ||
+		strings.Contains(m, "missing") ||
+		strings.Contains(m, "expired")
+	return gone && (strings.Contains(m, "thread") ||
+		strings.Contains(m, "session") ||
+		strings.Contains(m, "rollout"))
 }
 
 // abortCodexAndHarvest handles a client disconnect mid-stream: SIGINT the

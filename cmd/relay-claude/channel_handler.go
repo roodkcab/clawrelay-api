@@ -199,14 +199,33 @@ func handleChannelEphemeralStreamResponse(w http.ResponseWriter, r *http.Request
 	// The throwaway process is always killed when this turn ends (completion,
 	// stop, or AskUserQuestion). kill() abandons the active turn (unblocking the
 	// stdout reader), and the background drain lets all worker goroutines exit.
+	// drainWithGrace 在 deadCh 已触发后继续限时接收 lines：deadCh 关闭后它恒可
+	// 读，与仍有缓冲的 lines 双就绪时 select 是伪随机选择——不加宽限期会有约一半
+	// 概率把已缓冲的 result 连同 usage 一起丢掉（进程死亡与 result 送达几乎同时
+	// 是 interrupt 的常规时序，不是边角）。
+	drainWithGrace := func(fn func(string) bool) {
+		grace := time.After(500 * time.Millisecond)
+		for {
+			select {
+			case ln, ok := <-lines:
+				if !ok {
+					return
+				}
+				fn(ln)
+			case <-grace:
+				return
+			}
+		}
+	}
+
 	finished := false
 	finish := func() {
 		if finished {
 			return
 		}
 		finished = true
-		channelMgr.untrackInflight(worker)
 		worker.kill()
+		channelMgr.untrackInflight(worker)
 		go func() {
 			for {
 				select {
@@ -220,7 +239,8 @@ func handleChannelEphemeralStreamResponse(w http.ResponseWriter, r *http.Request
 					// 走到这里，故无重复计数）。
 					recordEphemeralResult(ln)
 				case <-worker.deadCh:
-					return // process reaped; lines may never close
+					drainWithGrace(recordEphemeralResult)
+					return
 				}
 			}
 		}()
@@ -235,7 +255,6 @@ func handleChannelEphemeralStreamResponse(w http.ResponseWriter, r *http.Request
 			return
 		}
 		finished = true
-		channelMgr.untrackInflight(worker)
 		_ = worker.interrupt()
 		go func() {
 			deadline := time.After(10 * time.Second)
@@ -250,13 +269,17 @@ func handleChannelEphemeralStreamResponse(w http.ResponseWriter, r *http.Request
 						break harvest
 					}
 				case <-worker.deadCh:
+					drainWithGrace(recordEphemeralResult) // 缓冲里可能还躺着 result
 					break harvest
 				case <-deadline:
 					log.Printf("[channel] ephemeral usage harvest timed out (10s) session=%s", sid)
 					break harvest
 				}
 			}
+			// kill 之后才 untrack：收割窗口（最长 10s）内 worker 必须留在
+			// inflight 里，否则 SIGTERM 时 Stop() 找不到它，claude 变孤儿进程。
 			worker.kill()
+			channelMgr.untrackInflight(worker)
 			for {
 				select {
 				case _, ok := <-lines:
@@ -294,9 +317,11 @@ func handleChannelEphemeralStreamResponse(w http.ResponseWriter, r *http.Request
 	for {
 		select {
 		case <-r.Context().Done():
-			// Upstream disconnected = stop. Ephemeral run: just kill it (the
-			// deferred finish's drain still harvests an already-buffered result).
-			log.Printf("[channel] ephemeral stop session=%s (kill)", sid)
+			// Upstream disconnected = stop. 与 V1/持久 channel 口径一致：先
+			// interrupt 让 claude 吐带真实 usage 的 result 并收割记账，再 kill
+			// 兜底（直接 SIGKILL 的话被停轮的消耗永久漏计）。
+			log.Printf("[channel] ephemeral stop session=%s (interrupt+harvest)", sid)
+			finishWithHarvest()
 			return
 		case <-worker.deadCh:
 			// Process died mid-turn; `lines` may never close. Finalize and exit
@@ -369,7 +394,7 @@ func handleChannelStreamResponse(w http.ResponseWriter, r *http.Request, req *op
 		model:        model,
 	}
 
-	worker, err := channelMgr.acquire(sessionID, p)
+	worker, err := channelMgr.acquire(r.Context(), sessionID, p)
 	if err != nil {
 		log.Printf("[channel] acquire failed session=%s: %v", sessionID, err)
 		openai.WriteError(w, http.StatusInternalServerError, "server_error", err.Error())
@@ -381,7 +406,7 @@ func handleChannelStreamResponse(w http.ResponseWriter, r *http.Request, req *op
 		// Worker died between acquire and beginTurn (e.g. reaped). One retry
 		// with a fresh acquire (which will spawn/resume).
 		log.Printf("[channel] beginTurn failed session=%s: %v; retrying acquire", sessionID, err)
-		if worker, err = channelMgr.acquire(sessionID, p); err == nil {
+		if worker, err = channelMgr.acquire(r.Context(), sessionID, p); err == nil {
 			lines, err = worker.beginTurn(content)
 		}
 		if err != nil {
@@ -434,8 +459,23 @@ func handleChannelStreamResponse(w http.ResponseWriter, r *http.Request, req *op
 					// 同时把这轮的差分 usage 记入 stats（中断轮前台没有任何记账）。
 					recordInterruptedTurnUsage(worker.meter, ln, meterModel)
 				case <-worker.deadCh:
-					// Process died; lines may never close. Stop waiting so the
-					// worker is released rather than leaking this goroutine.
+					// Process died; lines may never close. 先限时扫掉已缓冲的行
+					// （interrupt 的 result 常与进程退出同刻到达，deadCh 与 lines
+					// 双就绪时 select 伪随机，不扫会有约一半概率丢掉这轮记账），
+					// 再释放 worker，避免泄漏本 goroutine。
+					grace := time.After(500 * time.Millisecond)
+				drain:
+					for {
+						select {
+						case ln, ok := <-lines:
+							if !ok {
+								break drain
+							}
+							recordInterruptedTurnUsage(worker.meter, ln, meterModel)
+						case <-grace:
+							break drain
+						}
+					}
 					timer.Stop()
 					worker.endTurn()
 					return

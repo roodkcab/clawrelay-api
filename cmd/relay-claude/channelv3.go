@@ -275,6 +275,7 @@ func (m *v3Manager) killSession(sid string) {
 	delete(m.inbox, sid)
 	m.mu.Unlock()
 	if s != nil {
+		m.flushV3Orphan(s, "kill-session") // 断连后烧掉的尾巴 token 最后一次入账机会
 		s.kill()
 	}
 }
@@ -394,6 +395,47 @@ func (m *v3Manager) harvestV3Usage(s *v3Session, model string, graceRetry bool) 
 	log.Printf("[v3] usage session=%s claude_sid=%s models=%d input=%d output=%d cache_read=%d cache_creation=%d",
 		s.sid, s.claudeSID, len(perModel), input, output, cacheRead, cacheCreation)
 	return openai.BuildUsageInfo(input, output, cacheRead, cacheCreation)
+}
+
+// flushV3Orphan sweeps any transcript increment that accrued OUTSIDE a metered
+// turn window — tokens claude kept burning after a stop/idle-timeout, or the
+// tail of a torn-down session. They belong to an already-counted turn, so they
+// go into /v1/stats as orphan tokens (no request increment) and are NEVER
+// attached to a later turn's usage chunk (that would inflate the next
+// message's robot_chat_logs row). Quiet no-op when there is nothing to sweep.
+func (m *v3Manager) flushV3Orphan(s *v3Session, where string) {
+	if s == nil {
+		return
+	}
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+	if s.transcriptPath == "" {
+		if s.transcriptPath = v3FindTranscript(s.claudeSID); s.transcriptPath == "" {
+			return
+		}
+	}
+	perModel, newOff, ids, err := readV3UsageWindow(s.transcriptPath, s.usageOffset, s.prevReqIDs)
+	if err != nil {
+		return
+	}
+	s.usageOffset = newOff
+	if s.prevReqIDs == nil {
+		s.prevReqIDs = make(map[string]struct{})
+	}
+	for id := range ids {
+		s.prevReqIDs[id] = struct{}{}
+	}
+	if len(perModel) == 0 {
+		return
+	}
+	stats.RecordOrphanTokens(perModel)
+	var input, output int
+	for _, c := range perModel {
+		input += c.Input
+		output += c.Output
+	}
+	log.Printf("[v3] orphan usage swept (%s) session=%s claude_sid=%s input=%d output=%d — attributed to stats only, not to any turn",
+		where, s.sid, s.claudeSID, input, output)
 }
 
 // v3TurnOutcome is what one runAttempt() of handleChannelV3Response resolves to.
@@ -688,7 +730,10 @@ func (m *v3Manager) evictOldestLocked() {
 	s := m.sessions[oldest]
 	delete(m.sessions, oldest)
 	log.Printf("[v3] capacity evict session=%s", oldest)
-	go s.kill()
+	go func() {
+		m.flushV3Orphan(s, "evict")
+		s.kill()
+	}()
 }
 
 // StartReaper kills sessions idle longer than IdleTTL.
@@ -724,6 +769,7 @@ func (m *v3Manager) reapOnce() {
 	m.mu.Unlock()
 	for _, s := range toKill {
 		log.Printf("[v3] reaping idle session=%s", s.sid)
+		m.flushV3Orphan(s, "reap")
 		s.kill()
 	}
 }
@@ -878,6 +924,10 @@ func handleChannelV3Response(w http.ResponseWriter, r *http.Request, req *openai
 		}
 
 		// Phase 2: send the turn into the live session and stream the reply.
+		// 开窗前先把上一轮 stop/超时后 claude 继续写入的遗留增量单独入账（orphan，
+		// 只进 /v1/stats 总账）——否则这些 token 会整段算进本轮的 usage chunk，
+		// 污染下游 robot_chat_logs 的单条消息用量（B-3）。
+		v3Mgr.flushV3Orphan(sess, "turn-start")
 		log.Printf("[v3] turn start session=%s req=%s model=%s chat=%s", sid, reqID, model, chatID)
 		v3Mgr.enqueue(sid, v3Msg{ReqID: reqID, Content: content})
 
@@ -943,12 +993,12 @@ func handleChannelV3Response(w http.ResponseWriter, r *http.Request, req *openai
 					log.Printf("[v3] session died before any output session=%s req=%s", sid, reqID)
 					return v3OutcomeColdHang
 				}
-				var usage *openai.UsageInfo
+				// Meter what the dead claude wrote to its transcript regardless of
+				// whether content streamed（B-1：只发过 progress 的长工具轮同样烧了
+				// 真金白银的 token，进程死亡不能让它从 /v1/stats 消失）。No grace
+				// retry: the writer is gone, nothing more will appear.
+				usage := v3Mgr.harvestV3Usage(sess, model, false)
 				if streamed {
-					// Session died but content already streamed → close cleanly and
-					// still meter what the dead claude wrote to its transcript (no
-					// grace retry: the writer is gone, nothing more will appear).
-					usage = v3Mgr.harvestV3Usage(sess, model, false)
 					v3EmitClose(w, flusher, chatID, created, model, "", includeUsage, usage)
 				} else {
 					fmt.Fprintf(w, "data: %s\n\n", v3ErrChunk(chatID, created, model, "claude session ended"))
@@ -959,6 +1009,10 @@ func handleChannelV3Response(w http.ResponseWriter, r *http.Request, req *openai
 				log.Printf("[v3] session=%s died mid-turn req=%s streamed=%v", sid, reqID, streamed)
 				return v3OutcomeDone
 			case <-r.Context().Done():
+				// 断连（=stop）也要入账（B-2）：收割到目前为止的增量并计请求数；
+				// 之后 claude 继续烧的部分由 turn-start/teardown 的 orphan sweep
+				// 兜底。无 SSE 可发（客户端已走），usage 只进 /v1/stats。
+				_ = v3Mgr.harvestV3Usage(sess, model, false)
 				log.Printf("[v3] client disconnected session=%s req=%s (session kept alive)", sid, reqID)
 				return v3OutcomeClientGone
 			case <-idle.C:

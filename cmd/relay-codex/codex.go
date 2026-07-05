@@ -57,10 +57,10 @@ func cleanEnv(extra map[string]string) []string {
 // session/thread reconciliation. It captures whether this turn is a fresh
 // session or a resume, and whether multipart history needs flattening.
 type codexInput struct {
-	Args      []string  // CLI args after `codex`
-	Stdin     string    // body to pipe on stdin
-	IsResume  bool      // true = `codex exec resume <thread_id>` pattern
-	ImagePath []string  // images to attach via -i (collected from latest user message)
+	Args      []string // CLI args after `codex`
+	Stdin     string   // body to pipe on stdin
+	IsResume  bool     // true = `codex exec resume <thread_id>` pattern
+	ImagePath []string // images to attach via -i (collected from latest user message)
 }
 
 // buildCodexInput converts the high-level OpenAI request into a fully-resolved

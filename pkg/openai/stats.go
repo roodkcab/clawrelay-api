@@ -121,6 +121,33 @@ func (s *Stats) RecordTurn(requestModel string, perModel map[string]TokenCounts)
 	}
 }
 
+// RecordOrphanTokens accrues tokens/cost WITHOUT counting a request — for
+// late-arriving tail usage of a turn that was already counted (e.g. tokens a
+// V3 claude burned after its client disconnected, swept up at the next turn's
+// window start or at session teardown).
+func (s *Stats) RecordOrphanTokens(perModel map[string]TokenCounts) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for model, c := range perModel {
+		s.input += int64(c.Input)
+		s.output += int64(c.Output)
+		s.cacheCreation += int64(c.CacheCreation)
+		s.cacheRead += int64(c.CacheRead)
+		s.costUSD += c.CostUSD
+		ms, ok := s.perModel[model]
+		if !ok {
+			ms = &ModelTokenStats{}
+			s.perModel[model] = ms
+		}
+		ms.Input += int64(c.Input)
+		ms.Output += int64(c.Output)
+		ms.CacheCreation += int64(c.CacheCreation)
+		ms.CacheRead += int64(c.CacheRead)
+		ms.Total += int64(c.Input + c.Output + c.CacheCreation + c.CacheRead)
+		ms.CostUSD += c.CostUSD
+	}
+}
+
 // Snapshot returns a deep-copied view safe for marshaling.
 func (s *Stats) Snapshot() TokenStatsSnapshot {
 	s.mu.Lock()

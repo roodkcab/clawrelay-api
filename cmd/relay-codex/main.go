@@ -3,13 +3,13 @@
 // events into Claude shape — it emits OpenAI SSE directly from codex's
 // native JSONL events, and exploits codex's first-class features:
 //
-//   * Thread-based resume: when the client supplies a stable session_id,
+//   - Thread-based resume: when the client supplies a stable session_id,
 //     follow-up turns send only the latest user message via
 //     `codex exec resume <thread_id>` instead of re-shipping full history.
 //     Big token savings on long conversations.
-//   * Native multimodal attachments via `-i FILE`.
-//   * Reasoning effort via `-c model_reasoning_effort=`.
-//   * Multi-stage UX: command_execution surfaces as tool_calls, reasoning
+//   - Native multimodal attachments via `-i FILE`.
+//   - Reasoning effort via `-c model_reasoning_effort=`.
+//   - Multi-stage UX: command_execution surfaces as tool_calls, reasoning
 //     items as thinking deltas — visible in the UI even though codex doesn't
 //     stream individual tokens.
 package main
@@ -36,7 +36,8 @@ import (
 var version = "1.1.7"
 
 // buildCommit is stamped at build time via:
-//   go build -ldflags "-X main.buildCommit=$(git rev-parse --short HEAD)"
+//
+//	go build -ldflags "-X main.buildCommit=$(git rev-parse --short HEAD)"
 var buildCommit = "unknown"
 
 var defaultModel = "codex/gpt-5.5"
