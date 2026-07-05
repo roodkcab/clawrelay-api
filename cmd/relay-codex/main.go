@@ -31,7 +31,13 @@ import (
 	"clawrelay-api/pkg/sessions"
 )
 
-var version = "1.1.5"
+// version 1.1.6 被生产二进制占用但源码从未入库（版本漂移事故），跳到 1.1.7
+// 以保证线上版本号可比较；buildCommit 让 /health 能定位构建源。
+var version = "1.1.7"
+
+// buildCommit is stamped at build time via:
+//   go build -ldflags "-X main.buildCommit=$(git rev-parse --short HEAD)"
+var buildCommit = "unknown"
 
 var defaultModel = "codex/gpt-5.5"
 
@@ -166,6 +172,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		"status":  "healthy",
 		"backend": "codex",
 		"version": version,
+		"commit":  buildCommit,
 	})
 }
 
