@@ -117,3 +117,11 @@ channel 模式下，**所有 `stream=true` 且无 `tools` 的请求都走 stream
 - **deadCh 逃生**：beginTurn 写后复检 `deadCh` 快速失败；两个前台循环 + 两个后台 drain 都监听 `worker.deadCh`，进程中途死亡时绝不永久阻塞在「永不关闭的 lines」上。
 - **inTurn 标志**：reaper / 容量 evict **跳过正在流式的 worker**（流式时长超 idle-ttl 也不会被误杀）。
 - **inflight 集合**：spawn 出来但尚未 promote 的 worker（持久化 waitStartup 期 + ephemeral 运行期）都登记，SIGTERM `Stop()` 一并 kill，杜绝重启孤儿。
+
+## 10. 稳定性加固（relay-claude 2.1.0，2026-07-05）
+
+- **排队请求不再零字节等待**:SSE 头 + `: ping` 提前到 acquire 之前;同 session 排队等 turnMu 期间每 15s 发 `: queued` 注释,不再被上游 sock_read=120s 掐断;等待感知 ctx(客户端断开即放弃,消息不再"注入即被 interrupt"白进历史)。头发出后的错误改走 SSE 错误块(⚠️ 文本 + finish + [DONE]),不再是死流。
+- **stdout scanner 错误不再产生僵尸 worker**:单行 >8MB(巨型工具结果)或读错误时,drainStdout 退出前标记 dead + KillGroup,后续请求走正常 respawn;旧行为是 worker 假活、写 stdin 永远无回应、claude 卡死在写满的管道上。
+- **cmd.Wait 顺序修正**:两个 pipe reader 退出后才 Wait(os/exec 约定),interrupt 后缓冲里的 result 行不再被 Wait 关管道截断;deadCh 严格晚于 stderr 排空,waitStartup 不再可能错过 already_in_use/no_conversation 标记。
+- **kill 带 reaped 防护**:进程已收割后不再裸 kill(-pid),防 PID 复用误杀。
+- **drop() 尊重活跃 turn**:同 session 非流式/带 tools 请求 fall through V1 前,先 ctx 感知地等 turnMu 到手再 kill(不再当场杀断正在流式输出的 turn);等不到(ctx 取消)返回 503 "session busy"。
