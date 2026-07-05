@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -178,6 +179,23 @@ func handleChannelEphemeralStreamResponse(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// recordEphemeralResult 解析一行残余输出：是 result 就给这轮 ephemeral 记账
+	// （identityMeter 场景：bare/modelUsage 都是本轮值，perModelCounts 直接按实际
+	// 消费模型归属）。返回是否记到（A9）。
+	recordEphemeralResult := func(line string) bool {
+		var event claudeEvent
+		if json.Unmarshal([]byte(line), &event) != nil || event.Type != "result" {
+			return false
+		}
+		pm := perModelCounts(&event, model)
+		if pm == nil {
+			return false
+		}
+		stats.RecordTurn(model, pm)
+		log.Printf("[channel] ephemeral interrupted-turn usage recorded session=%s model=%s per_model=%+v", sid, model, pm)
+		return true
+	}
+
 	// The throwaway process is always killed when this turn ends (completion,
 	// stop, or AskUserQuestion). kill() abandons the active turn (unblocking the
 	// stdout reader), and the background drain lets all worker goroutines exit.
@@ -192,10 +210,15 @@ func handleChannelEphemeralStreamResponse(w http.ResponseWriter, r *http.Request
 		go func() {
 			for {
 				select {
-				case _, ok := <-lines:
+				case ln, ok := <-lines:
 					if !ok {
 						return
 					}
+					// 机会主义收割（A9 minimal）：kill 已发出，SIGKILL 后 claude
+					// 不会再补 result；但进程死前已缓冲进管道的 result 能捞到就
+					// 捞（正常完成路径的 result 已被前台 feed 消费并记账，不会
+					// 走到这里，故无重复计数）。
+					recordEphemeralResult(ln)
 				case <-worker.deadCh:
 					return // process reaped; lines may never close
 				}
@@ -203,6 +226,49 @@ func handleChannelEphemeralStreamResponse(w http.ResponseWriter, r *http.Request
 		}()
 	}
 	defer finish()
+
+	// finishWithHarvest 用于 AskUserQuestion 分支（A9 full）：该轮被我们主动
+	// 截断，result 还没出来。先 stdin interrupt（claude 中止当前轮并 emit 带真实
+	// usage 的 result）→ 限时 10s 收割记账 → 再 kill 兜底 + 排空。
+	finishWithHarvest := func() {
+		if finished {
+			return
+		}
+		finished = true
+		channelMgr.untrackInflight(worker)
+		_ = worker.interrupt()
+		go func() {
+			deadline := time.After(10 * time.Second)
+		harvest:
+			for {
+				select {
+				case ln, ok := <-lines:
+					if !ok {
+						break harvest
+					}
+					if recordEphemeralResult(ln) {
+						break harvest
+					}
+				case <-worker.deadCh:
+					break harvest
+				case <-deadline:
+					log.Printf("[channel] ephemeral usage harvest timed out (10s) session=%s", sid)
+					break harvest
+				}
+			}
+			worker.kill()
+			for {
+				select {
+				case _, ok := <-lines:
+					if !ok {
+						return
+					}
+				case <-worker.deadCh:
+					return
+				}
+			}
+		}()
+	}
 
 	log.Printf("[channel] ephemeral turn start session=%s model=%s chat=%s", sid, model, chatID)
 
@@ -224,17 +290,19 @@ func handleChannelEphemeralStreamResponse(w http.ResponseWriter, r *http.Request
 	heartbeat := time.NewTicker(30 * time.Second)
 	defer heartbeat.Stop()
 
-	t := newSSETranslator(chatID, created, model, "", identityMeter{}) // no session → log no-ops
+	t := newSSETranslator(chatID, created, model, "", identityMeter{}, "") // no session → log no-ops
 	for {
 		select {
 		case <-r.Context().Done():
-			// Upstream disconnected = stop. Ephemeral run: just kill it.
+			// Upstream disconnected = stop. Ephemeral run: just kill it (the
+			// deferred finish's drain still harvests an already-buffered result).
 			log.Printf("[channel] ephemeral stop session=%s (kill)", sid)
 			return
 		case <-worker.deadCh:
 			// Process died mid-turn; `lines` may never close. Finalize and exit
 			// rather than block forever (finish kills + drains).
 			t.flushAggLog()
+			t.EmitFinishIfNoResult(w, flusher) // died without result → synthetic finish (A2)
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
 			log.Printf("[channel] ephemeral turn end session=%s (process died)", sid)
@@ -245,6 +313,7 @@ func handleChannelEphemeralStreamResponse(w http.ResponseWriter, r *http.Request
 		case line, lok := <-lines:
 			if !lok {
 				t.flushAggLog()
+				t.EmitFinishIfNoResult(w, flusher) // closed without result → synthetic finish (A2)
 				fmt.Fprintf(w, "data: [DONE]\n\n")
 				flusher.Flush()
 				log.Printf("[channel] ephemeral turn end session=%s (completed)", sid)
@@ -254,8 +323,10 @@ func handleChannelEphemeralStreamResponse(w http.ResponseWriter, r *http.Request
 				continue
 			}
 			if t.feed(w, flusher, line, includeUsage) == outcomeAskUserDone {
-				// No session to continue on; the card was emitted, kill the run.
+				// No session to continue on; the card was emitted. Interrupt →
+				// harvest the aborted turn's usage → kill (A9).
 				log.Printf("[channel] ephemeral turn end session=%s (ask_user)", sid)
+				finishWithHarvest()
 				return
 			}
 		}
@@ -321,6 +392,14 @@ func handleChannelStreamResponse(w http.ResponseWriter, r *http.Request, req *op
 	log.Printf("[channel] turn start session=%s claude_sid=%s flag=%s model=%s chat=%s",
 		sessionID, worker.SessionID(), worker.usedFlag, model, chatID)
 
+	// Stats attribution follows the worker's spawn-time model, not the request
+	// model: after a hot model switch the persistent process keeps consuming
+	// under the old model until respawn (A5).
+	meterModel := worker.boundModel
+	if meterModel == "" {
+		meterModel = model
+	}
+
 	// Exactly one of these takes ownership of releasing the worker (endTurn):
 	// the foreground path on normal completion, or a background drainer when we
 	// interrupt (stop / AskUserQuestion). turnReleased guards against both.
@@ -351,7 +430,9 @@ func handleChannelStreamResponse(w http.ResponseWriter, r *http.Request, req *op
 						worker.endTurn()
 						return
 					}
-					advanceMeterFromLine(worker.meter, ln)
+					// 中断轮记账（A7）：解析残余行中的 result，推进 meter 基线的
+					// 同时把这轮的差分 usage 记入 stats（中断轮前台没有任何记账）。
+					recordInterruptedTurnUsage(worker.meter, ln, meterModel)
 				case <-worker.deadCh:
 					// Process died; lines may never close. Stop waiting so the
 					// worker is released rather than leaking this goroutine.
@@ -387,7 +468,7 @@ func handleChannelStreamResponse(w http.ResponseWriter, r *http.Request, req *op
 	heartbeat := time.NewTicker(30 * time.Second)
 	defer heartbeat.Stop()
 
-	t := newSSETranslator(chatID, created, model, sessionID, worker.meter)
+	t := newSSETranslator(chatID, created, model, sessionID, worker.meter, worker.boundModel)
 	ctxCh := r.Context().Done()
 
 	for {
@@ -401,6 +482,7 @@ func handleChannelStreamResponse(w http.ResponseWriter, r *http.Request, req *op
 			// Process died mid-turn; `lines` may never close. Finalize and let
 			// the deferred endTurn release the worker.
 			t.flushAggLog()
+			t.EmitFinishIfNoResult(w, flusher) // died without result → synthetic finish (A2)
 			sessionStore.LogDone(sessionID, t.StreamUsage())
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
@@ -411,8 +493,11 @@ func handleChannelStreamResponse(w http.ResponseWriter, r *http.Request, req *op
 			flusher.Flush()
 		case line, lok := <-lines:
 			if !lok {
-				// Turn's result closed the channel: normal completion.
+				// Turn's result closed the channel: normal completion. (If the
+				// channel closed WITHOUT a result — e.g. drainStdout scanner
+				// error — the translator still owes a terminal chunk.)
 				t.flushAggLog()
+				t.EmitFinishIfNoResult(w, flusher)
 				sessionStore.LogDone(sessionID, t.StreamUsage())
 				fmt.Fprintf(w, "data: [DONE]\n\n")
 				flusher.Flush()

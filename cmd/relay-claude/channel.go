@@ -396,6 +396,12 @@ type chanManager struct {
 	mu       sync.Mutex
 	workers  map[string]*chanWorker
 	inflight map[*chanWorker]struct{}
+	// spawning single-flights acquire() per session_id: the first request
+	// registers a channel here and spawns; concurrent requests for the same
+	// session wait on it and re-check instead of double-spawning (two persistent
+	// processes writing the same session jsonl). Closed + removed when the
+	// spawn attempt finishes, success or not.
+	spawning map[string]chan struct{}
 }
 
 func newChanManager(cfg chanManagerConfig) *chanManager {
@@ -403,6 +409,7 @@ func newChanManager(cfg chanManagerConfig) *chanManager {
 		cfg:      cfg,
 		workers:  make(map[string]*chanWorker),
 		inflight: make(map[*chanWorker]struct{}),
+		spawning: make(map[string]chan struct{}),
 	}
 }
 
@@ -492,36 +499,61 @@ type spawnParams struct {
 // acquire returns a live worker for sessionID, spawning one if necessary. On a
 // fresh spawn it picks --session-id vs --resume from on-disk session presence,
 // and retries with the opposite flag if claude rejects the first choice.
+// Spawning is single-flighted per session (A8): concurrent requests that miss
+// the registry wait for the in-progress spawn and re-check, instead of racing
+// a second process onto the same session.
 func (m *chanManager) acquire(sessionID string, p spawnParams) (*chanWorker, error) {
-	m.mu.Lock()
-	if w, ok := m.workers[sessionID]; ok && !w.Dead() {
-		w.markUsed()
-		// Warn (but honor spawn-time binding) if the model/system changed.
-		if p.model != "" && w.boundModel != "" && p.model != w.boundModel {
-			log.Printf("[channel] WARN session=%s model changed %q->%q; persistent process keeps spawn-time model", sessionID, w.boundModel, p.model)
+	var spawnCh chan struct{}
+	for {
+		m.mu.Lock()
+		if w, ok := m.workers[sessionID]; ok && !w.Dead() {
+			w.markUsed()
+			// Warn (but honor spawn-time binding) if the model/system changed.
+			if p.model != "" && w.boundModel != "" && p.model != w.boundModel {
+				log.Printf("[channel] WARN session=%s model changed %q->%q; persistent process keeps spawn-time model", sessionID, w.boundModel, p.model)
+			}
+			if p.systemPrompt != w.boundSystemPrompt {
+				log.Printf("[channel] WARN session=%s system_prompt changed since spawn; ignored (bound at spawn)", sessionID)
+			}
+			m.mu.Unlock()
+			return w, nil
 		}
-		if p.systemPrompt != w.boundSystemPrompt {
-			log.Printf("[channel] WARN session=%s system_prompt changed since spawn; ignored (bound at spawn)", sessionID)
+		delete(m.workers, sessionID)
+		if ch, ok := m.spawning[sessionID]; ok {
+			// Another request is already spawning this session's worker: wait
+			// for it and re-check (it may have promoted a live worker, or
+			// failed — in which case this request becomes the next spawner).
+			m.mu.Unlock()
+			<-ch
+			continue
 		}
-		m.mu.Unlock()
-		return w, nil
-	}
-	delete(m.workers, sessionID)
-	if m.cfg.MaxChannels > 0 {
-		alive := 0
-		for _, w := range m.workers {
-			if !w.Dead() {
-				alive++
+		spawnCh = make(chan struct{})
+		m.spawning[sessionID] = spawnCh
+		if m.cfg.MaxChannels > 0 {
+			alive := 0
+			for _, w := range m.workers {
+				if !w.Dead() {
+					alive++
+				}
+			}
+			if alive >= m.cfg.MaxChannels {
+				m.evictOldestLocked()
 			}
 		}
-		if alive >= m.cfg.MaxChannels {
-			m.evictOldestLocked()
-		}
+		m.mu.Unlock()
+		break
 	}
-	m.mu.Unlock()
 
 	w, err := m.spawnWithRetry(sessionID, p)
+
+	// Release the single-flight (success or failure) and promote in the SAME
+	// critical section, so a waiter's re-check either sees the live worker or
+	// finds spawning empty and takes over.
+	m.mu.Lock()
+	delete(m.spawning, sessionID)
+	close(spawnCh)
 	if err != nil {
+		m.mu.Unlock()
 		return nil, err
 	}
 
@@ -529,8 +561,15 @@ func (m *chanManager) acquire(sessionID string, p spawnParams) (*chanWorker, err
 	// the spawn ran outside m.mu, so its onDie could have fired-and-found-nothing
 	// before this insert. A dead worker here is returned unregistered; beginTurn
 	// will fail and the caller re-acquires.
-	m.mu.Lock()
 	delete(m.inflight, w)
+	if existing, ok := m.workers[sessionID]; ok && !existing.Dead() && existing != w {
+		// 理论上单飞后到不了这里；防御：已有活 worker 就杀掉新 spawn 的，用旧的，
+		// 保证同一 session 永远只有一个持久进程写它的 jsonl。
+		m.mu.Unlock()
+		log.Printf("[channel] WARN session=%s: live worker appeared during spawn; killing the duplicate", sessionID)
+		w.kill()
+		return existing, nil
+	}
 	if !w.Dead() {
 		m.workers[sessionID] = w
 	}
