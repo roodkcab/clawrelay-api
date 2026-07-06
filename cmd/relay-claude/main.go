@@ -24,7 +24,15 @@ import (
 	"clawrelay-api/pkg/sessions"
 )
 
-var version = "2.0.2"
+var version = "2.0.3"
+
+// buildCommit is stamped at build time via:
+//
+//	go build -ldflags "-X main.buildCommit=$(git rev-parse --short HEAD)"
+//
+// so /health can tell exactly which source built a running binary (the
+// 1.1.6-not-in-repo incident made version numbers alone untrustworthy).
+var buildCommit = "unknown"
 
 var defaultModel = "vllm/claude-sonnet-4-6"
 
@@ -228,6 +236,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		"status":  "healthy",
 		"backend": "claude",
 		"version": version,
+		"commit":  buildCommit,
 		"mode":    relayMode,
 	})
 }

@@ -5,12 +5,61 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os/exec"
 	"strings"
 	"time"
 
 	"clawrelay-api/pkg/openai"
 	"clawrelay-api/pkg/proc"
 )
+
+// abortClaudeAndHarvestUsage 中断 V1 进程并在后台限时收割该轮 usage：
+// SIGINT → 最多 10s 内解析残余行中的 result（modelUsage 有真实值）→
+// stats.RecordTurn 记账（+日志）→ KillGroup 兜底 + 排空。
+//
+// 实证依据（claude 2.1.199）：被 SIGINT 后 claude 仍会 emit result 事件
+// （subtype=error_during_execution），bare usage 全 0，但 modelUsage 各条目带
+// 真实 token 和 costUSD，顶层 total_cost_usd 也有值 —— 直接 KillGroup 会把这
+// 一轮的消耗整个丢掉，这正是 V1 中断轮从不记账的根因。
+func abortClaudeAndHarvestUsage(cmd *exec.Cmd, lines <-chan string, model, sessionID string) {
+	proc.InterruptGroup(cmd)
+	go func() {
+		deadline := time.After(10 * time.Second)
+	harvest:
+		for {
+			select {
+			case line, ok := <-lines:
+				if !ok {
+					break harvest // producer closed: process exited without a result
+				}
+				if line == "" {
+					continue
+				}
+				var event claudeEvent
+				if err := json.Unmarshal([]byte(line), &event); err != nil {
+					continue
+				}
+				if event.Type != "result" {
+					continue
+				}
+				if pm := perModelCounts(&event, model); pm != nil {
+					stats.RecordTurn(model, pm)
+					log.Printf("interrupted-turn usage recorded: model=%s session=%s per_model=%+v total_cost=$%.4f",
+						model, sessionID, pm, event.TotalCostUSD)
+				}
+				break harvest
+			case <-deadline:
+				log.Printf("interrupted-turn usage harvest timed out (10s): model=%s session=%s", model, sessionID)
+				break harvest
+			}
+		}
+		// Backstop kill (idempotent if SIGINT already ended it) and drain the
+		// remaining lines so the producer goroutine reaches cmd.Wait().
+		proc.KillGroup(cmd)
+		for range lines { //nolint:revive // intentional drain
+		}
+	}()
+}
 
 // handleStreamResponse streams Claude output without tool-call detection.
 // Used when no tools are defined in the request (fast path). The stream-json →
@@ -35,6 +84,8 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		// 非用户中断（本地 ResponseWriter 不支持 flush，属于部署/中间件问题），
+		// 不做 SIGINT 收割：直接杀掉并排空即可。
 		log.Printf("Streaming not supported")
 		if cmd := *cmdPtr; cmd != nil {
 			proc.KillGroup(cmd)
@@ -49,7 +100,7 @@ func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string,
 	heartbeatTicker := time.NewTicker(30 * time.Second)
 	defer heartbeatTicker.Stop()
 
-	t := newSSETranslator(chatID, created, model, sessionID, identityMeter{})
+	t := newSSETranslator(chatID, created, model, sessionID, identityMeter{}, "")
 
 processLines:
 	for {
@@ -57,10 +108,13 @@ processLines:
 		var ok bool
 		select {
 		case <-r.Context().Done():
+			// disconnect (= upstream stop): SIGINT + harvest the aborted turn's
+			// usage before the backstop kill (A3).
 			if cmd := *cmdPtr; cmd != nil {
-				proc.KillGroup(cmd) // disconnect: kill the still-running group
+				abortClaudeAndHarvestUsage(cmd, lines, model, sessionID)
+			} else {
+				proc.DrainLines(lines)
 			}
-			proc.DrainLines(lines)
 			return
 		case <-heartbeatTicker.C:
 			fmt.Fprintf(w, ": keepalive\n\n")
@@ -77,15 +131,19 @@ processLines:
 
 		if t.feed(w, flusher, line, includeUsage) == outcomeAskUserDone {
 			if cmd := *cmdPtr; cmd != nil && cmd.Process != nil {
-				log.Printf("[ASK_USER_QUESTION] killing Claude process group pid=%d", cmd.Process.Pid)
-				proc.KillGroup(cmd)
+				log.Printf("[ASK_USER_QUESTION] interrupting Claude process group pid=%d (usage harvest, then kill)", cmd.Process.Pid)
+				abortClaudeAndHarvestUsage(cmd, lines, model, sessionID)
+			} else {
+				proc.DrainLines(lines)
 			}
-			proc.DrainLines(lines)
 			return
 		}
 	}
 
 	t.flushAggLog()
+	// Process exited without a result event (crash / scanner truncation): give
+	// the client a terminal finish chunk before [DONE] (A2).
+	t.EmitFinishIfNoResult(w, flusher)
 	sessionStore.LogDone(sessionID, t.StreamUsage())
 
 	fmt.Fprintf(w, "data: [DONE]\n\n")
@@ -113,6 +171,7 @@ func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args [
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		// 非用户中断（flush 不可用），不做 SIGINT 收割：直接杀掉并排空。
 		log.Printf("Streaming not supported")
 		if cmd := *cmdPtr; cmd != nil {
 			proc.KillGroup(cmd)
@@ -142,10 +201,13 @@ processLines:
 		var ok bool
 		select {
 		case <-r.Context().Done():
+			// disconnect (= upstream stop): SIGINT + harvest the aborted turn's
+			// usage before the backstop kill (A3).
 			if cmd := *cmdPtr; cmd != nil {
-				proc.KillGroup(cmd) // disconnect: kill the still-running group
+				abortClaudeAndHarvestUsage(cmd, lines, model, sessionID)
+			} else {
+				proc.DrainLines(lines)
 			}
-			proc.DrainLines(lines)
 			return
 		case <-heartbeatTicker.C:
 			fmt.Fprintf(w, ": keepalive\n\n")
@@ -238,13 +300,11 @@ processLines:
 					flusher.Flush()
 
 					if cmd := *cmdPtr; cmd != nil && cmd.Process != nil {
-						log.Printf("[ASK_USER_QUESTION] killing Claude process group pid=%d", cmd.Process.Pid)
-						proc.KillGroup(cmd)
+						log.Printf("[ASK_USER_QUESTION] interrupting Claude process group pid=%d (usage harvest, then kill)", cmd.Process.Pid)
+						abortClaudeAndHarvestUsage(cmd, lines, model, sessionID)
+					} else {
+						proc.DrainLines(lines)
 					}
-					go func() {
-						for range lines {
-						}
-					}()
 					return
 				}
 
@@ -319,12 +379,12 @@ processLines:
 			}
 			if eu := effectiveUsage(&event); eu != nil {
 				finalUsage = openai.BuildUsageInfo(eu.InputTokens, eu.OutputTokens, eu.CacheReadInputTokens, eu.CacheCreationInputTokens)
-				stats.Record(model, eu.InputTokens, eu.OutputTokens,
-					eu.CacheCreationInputTokens, eu.CacheReadInputTokens, event.TotalCostUSD)
-				log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f (subagents_included=%v)",
+				// V1 每请求进程：按实际消费模型归属（A4）；下游 usage chunk 仍用聚合值。
+				stats.RecordTurn(model, perModelCounts(&event, model))
+				log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f (per-model attribution, models=%d)",
 					model, eu.InputTokens, eu.OutputTokens,
 					eu.CacheReadInputTokens, eu.CacheCreationInputTokens, event.TotalCostUSD,
-					len(event.ModelUsage) > 0)
+					len(event.ModelUsage))
 			}
 		}
 	}
@@ -448,8 +508,14 @@ func handleNonStreamResponse(w http.ResponseWriter, r *http.Request, args []stri
 	}
 
 	if rawUsage != nil {
-		stats.Record(model, rawUsage.InputTokens, rawUsage.OutputTokens,
-			rawUsage.CacheCreationInputTokens, rawUsage.CacheReadInputTokens, costUSD)
+		// V1 每请求进程：从收集到的事件里找 result，按实际消费模型归属（A4）。
+		var resultEv *claudeEvent
+		for i := range events {
+			if events[i].Type == "result" {
+				resultEv = &events[i]
+			}
+		}
+		stats.RecordTurn(model, perModelCounts(resultEv, model))
 		log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f",
 			model, rawUsage.InputTokens, rawUsage.OutputTokens,
 			rawUsage.CacheReadInputTokens, rawUsage.CacheCreationInputTokens, costUSD)

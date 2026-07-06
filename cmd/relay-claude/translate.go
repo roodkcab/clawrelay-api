@@ -47,9 +47,16 @@ type sseTranslator struct {
 	model     string
 	sessionID string
 	meter     usageMeter
+	// meterModel is the model that stats accounting is attributed to. For a
+	// persistent channel worker this is the worker's spawn-time boundModel: a
+	// hot model switch changes the request `model` immediately, but the running
+	// process keeps consuming under the old model until respawn, so billing to
+	// the request model would misattribute. Empty means "same as model".
+	meterModel string
 
 	streamDeltaSent bool
 	streamUsage     *openai.UsageInfo
+	sawResult       bool // a result event reached feed (finish chunk emitted)
 	seenToolNames   map[string]bool
 
 	askUserIdx  int
@@ -63,9 +70,14 @@ type sseTranslator struct {
 	aggCount int
 }
 
-func newSSETranslator(chatID string, created int64, model, sessionID string, meter usageMeter) *sseTranslator {
+// newSSETranslator: meterModel is the stats-attribution model (see the field
+// comment); pass "" for V1/ephemeral paths, where it defaults to model.
+func newSSETranslator(chatID string, created int64, model, sessionID string, meter usageMeter, meterModel string) *sseTranslator {
 	if meter == nil {
 		meter = identityMeter{}
+	}
+	if meterModel == "" {
+		meterModel = model
 	}
 	return &sseTranslator{
 		chatID:        chatID,
@@ -73,6 +85,7 @@ func newSSETranslator(chatID string, created int64, model, sessionID string, met
 		model:         model,
 		sessionID:     sessionID,
 		meter:         meter,
+		meterModel:    meterModel,
 		seenToolNames: map[string]bool{},
 		askUserIdx:    -1,
 		toolBlocks:    map[int]*toolBlock{},
@@ -81,6 +94,27 @@ func newSSETranslator(chatID string, created int64, model, sessionID string, met
 
 // StreamUsage returns the usage captured from the turn's result event, if any.
 func (t *sseTranslator) StreamUsage() *openai.UsageInfo { return t.streamUsage }
+
+// EmitFinishIfNoResult emits a synthetic finish_reason="stop" chunk when the
+// stream is ending without ever having seen a result event (process crashed
+// mid-turn, stdout truncated by a scanner error, worker died) — otherwise the
+// downstream OpenAI client gets [DONE] with no terminal chunk and may treat
+// the response as aborted. No-op after a normal turn: the result branch of
+// feed already emitted the finish chunk (sawResult=true).
+func (t *sseTranslator) EmitFinishIfNoResult(w http.ResponseWriter, flusher http.Flusher) {
+	if t.sawResult {
+		return
+	}
+	log.Printf("stream ended without result event: chat=%s session=%s model=%s; emitting synthetic finish chunk",
+		t.chatID, t.sessionID, t.model)
+	finishReason := "stop"
+	t.emit(w, flusher, openai.ChatCompletionResponse{
+		ID: t.chatID, Object: "chat.completion.chunk", Created: t.created, Model: t.model,
+		Choices: []openai.ChatCompletionChoice{
+			{Index: 0, Delta: openai.NewChatMessage("", ""), FinishReason: &finishReason},
+		},
+	})
+}
 
 func (t *sseTranslator) flushAggLog() {
 	if t.aggCount == 0 {
@@ -274,21 +308,39 @@ func (t *sseTranslator) feed(w http.ResponseWriter, flusher http.Flusher, line s
 	}
 
 	if event.Type == "result" {
+		t.sawResult = true
 		if eu := effectiveUsage(&event); eu != nil {
-			cur := usageSnapshot{
-				input:          eu.InputTokens,
-				output:         eu.OutputTokens,
-				cacheCreation:  eu.CacheCreationInputTokens,
-				cacheRead:      eu.CacheReadInputTokens,
-				costUSD:        event.TotalCostUSD,
-				fromModelUsage: len(event.ModelUsage) > 0,
+			if _, isIdentity := t.meter.(identityMeter); isIdentity {
+				// V1 / ephemeral (one process per turn): the result figures ARE
+				// the per-turn values. Bill per actual consuming model via
+				// modelUsage (sub-agents may run on a different model); the
+				// downstream usage chunk keeps the aggregated view.
+				stats.RecordTurn(t.model, perModelCounts(&event, t.model))
+				log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f (per-model attribution, models=%d)",
+					t.model, eu.InputTokens, eu.OutputTokens,
+					eu.CacheReadInputTokens, eu.CacheCreationInputTokens, event.TotalCostUSD,
+					len(event.ModelUsage))
+				t.streamUsage = openai.BuildUsageInfo(eu.InputTokens, eu.OutputTokens, eu.CacheReadInputTokens, eu.CacheCreationInputTokens)
+			} else {
+				// Persistent channel process: figures are process-cumulative;
+				// the meter diffs them into this turn's delta. Attribution uses
+				// meterModel (the worker's spawn-time model), not the request
+				// model, so a hot model switch can't misattribute (A5).
+				cur := usageSnapshot{
+					input:          eu.InputTokens,
+					output:         eu.OutputTokens,
+					cacheCreation:  eu.CacheCreationInputTokens,
+					cacheRead:      eu.CacheReadInputTokens,
+					costUSD:        event.TotalCostUSD,
+					fromModelUsage: len(event.ModelUsage) > 0,
+				}
+				d := t.meter.perTurn(cur)
+				stats.Record(t.meterModel, d.input, d.output, d.cacheCreation, d.cacheRead, d.costUSD)
+				log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f raw_input=%d raw_cache_read=%d (subagents=%v)",
+					t.meterModel, d.input, d.output, d.cacheRead, d.cacheCreation, d.costUSD,
+					cur.input, cur.cacheRead, cur.fromModelUsage)
+				t.streamUsage = openai.BuildUsageInfo(d.input, d.output, d.cacheRead, d.cacheCreation)
 			}
-			d := t.meter.perTurn(cur)
-			stats.Record(t.model, d.input, d.output, d.cacheCreation, d.cacheRead, d.costUSD)
-			log.Printf("Token usage: model=%s input=%d output=%d cache_read=%d cache_create=%d cost=$%.4f raw_input=%d raw_cache_read=%d (subagents=%v)",
-				t.model, d.input, d.output, d.cacheRead, d.cacheCreation, d.costUSD,
-				cur.input, cur.cacheRead, cur.fromModelUsage)
-			t.streamUsage = openai.BuildUsageInfo(d.input, d.output, d.cacheRead, d.cacheCreation)
 		}
 
 		finishReason := "stop"

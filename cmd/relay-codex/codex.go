@@ -57,10 +57,10 @@ func cleanEnv(extra map[string]string) []string {
 // session/thread reconciliation. It captures whether this turn is a fresh
 // session or a resume, and whether multipart history needs flattening.
 type codexInput struct {
-	Args      []string  // CLI args after `codex`
-	Stdin     string    // body to pipe on stdin
-	IsResume  bool      // true = `codex exec resume <thread_id>` pattern
-	ImagePath []string  // images to attach via -i (collected from latest user message)
+	Args      []string // CLI args after `codex`
+	Stdin     string   // body to pipe on stdin
+	IsResume  bool     // true = `codex exec resume <thread_id>` pattern
+	ImagePath []string // images to attach via -i (collected from latest user message)
 }
 
 // buildCodexInput converts the high-level OpenAI request into a fully-resolved
@@ -262,10 +262,32 @@ func flattenForFreshSession(messages []openai.ChatMessage, sessionDir string) (p
 	return
 }
 
+// newRebuildFresh builds the retry closure used when resuming a codex thread
+// yields zero output. Verified empirically: `codex exec resume <dead-thread>`
+// exits 1 with EMPTY stdout — the "no rollout found for thread id ..." text
+// goes to stderr only, so no parseable error event ever reaches the handlers.
+// The closure drops the stale session→thread binding and rebuilds the input
+// as a brand-new session with the full message history replayed.
+func newRebuildFresh(threads *threadMap, req *openai.ChatCompletionRequest, model, sessionDir string) func() codexInput {
+	return func() codexInput {
+		threads.Forget(req.SessionID)
+		// The replacement thread restarts its cumulative counter from zero;
+		// keeping the old high-water baseline would clamp every following
+		// turn's diff to 0 (under-billing) until the new thread caught up.
+		if meter != nil {
+			meter.Forget(req.SessionID)
+		}
+		return buildCodexInput(req, model, "", sessionDir)
+	}
+}
+
 // launchCodex starts a `codex` subprocess and returns line channels. lines
-// carries stdout JSONL events; the channel closes after Wait. envExtra is
-// merged into the inherited environment minus codex bookkeeping vars.
-func launchCodex(input codexInput, workingDir string, envExtra map[string]string) (*exec.Cmd, <-chan string, error) {
+// carries stdout JSONL events; the channel closes after Wait. waitErr blocks
+// until the process has been reaped and returns cmd.Wait()'s error — because
+// close(lines) is deferred past cmd.Wait(), waitErr never blocks once the
+// caller has observed lines closing. envExtra is merged into the inherited
+// environment minus codex bookkeeping vars.
+func launchCodex(input codexInput, workingDir string, envExtra map[string]string) (*exec.Cmd, <-chan string, func() error, error) {
 	cmd := exec.Command("codex", input.Args...)
 	// Own process group so KillGroup can reap the whole tree (node wrapper +
 	// native codex binary) instead of orphaning the native child.
@@ -278,14 +300,14 @@ func launchCodex(input codexInput, workingDir string, envExtra map[string]string
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create stdout pipe: %v", err)
+		return nil, nil, nil, fmt.Errorf("failed to create stdout pipe: %v", err)
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create stderr pipe: %v", err)
+		return nil, nil, nil, fmt.Errorf("failed to create stderr pipe: %v", err)
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, nil, fmt.Errorf("failed to start codex: %v", err)
+		return nil, nil, nil, fmt.Errorf("failed to start codex: %v", err)
 	}
 
 	var stderrDone sync.WaitGroup
@@ -299,18 +321,34 @@ func launchCodex(input codexInput, workingDir string, envExtra map[string]string
 	}()
 
 	lines := make(chan string, 128)
+	waitDone := make(chan struct{})
+	var waitErrVal error // written once, before close(waitDone)
 	go func() {
-		defer close(lines)
+		defer close(lines) // deferred LAST → lines closes only after cmd.Wait()
 		s := bufio.NewScanner(stdoutPipe)
-		s.Buffer(make([]byte, 1024*1024), 1024*1024)
+		// 8MB max token: codex can emit very large single-line JSONL events
+		// (aggregated command output, big agent messages). The previous 1MB cap
+		// made the scanner abort silently mid-stream on oversized lines.
+		s.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 		for s.Scan() {
 			lines <- s.Text()
 		}
+		if err := s.Err(); err != nil {
+			log.Printf("WARNING: codex stdout scan aborted: %v (remaining output lost)", err)
+		}
 		stderrDone.Wait()
-		if err := cmd.Wait(); err != nil {
+		err := cmd.Wait()
+		if err != nil {
 			log.Printf("codex command error: %v", err)
 		}
+		waitErrVal = err
+		close(waitDone)
 	}()
 
-	return cmd, lines, nil
+	waitErr := func() error {
+		<-waitDone
+		return waitErrVal
+	}
+
+	return cmd, lines, waitErr, nil
 }

@@ -3,13 +3,13 @@
 // events into Claude shape — it emits OpenAI SSE directly from codex's
 // native JSONL events, and exploits codex's first-class features:
 //
-//   * Thread-based resume: when the client supplies a stable session_id,
+//   - Thread-based resume: when the client supplies a stable session_id,
 //     follow-up turns send only the latest user message via
 //     `codex exec resume <thread_id>` instead of re-shipping full history.
 //     Big token savings on long conversations.
-//   * Native multimodal attachments via `-i FILE`.
-//   * Reasoning effort via `-c model_reasoning_effort=`.
-//   * Multi-stage UX: command_execution surfaces as tool_calls, reasoning
+//   - Native multimodal attachments via `-i FILE`.
+//   - Reasoning effort via `-c model_reasoning_effort=`.
+//   - Multi-stage UX: command_execution surfaces as tool_calls, reasoning
 //     items as thinking deltas — visible in the UI even though codex doesn't
 //     stream individual tokens.
 package main
@@ -31,7 +31,15 @@ import (
 	"clawrelay-api/pkg/sessions"
 )
 
-var version = "1.1.5"
+// version 1.1.6 被生产二进制占用但源码从未入库（版本漂移事故）；本分支合入了
+// 该幽灵 1.1.6 的源码内容（usage 跨轮差分，PR #27），正式版本号为 1.1.7，
+// 以保证线上版本号可比较；buildCommit 让 /health 能定位构建源。
+var version = "1.1.7"
+
+// buildCommit is stamped at build time via:
+//
+//	go build -ldflags "-X main.buildCommit=$(git rev-parse --short HEAD)"
+var buildCommit = "unknown"
 
 var defaultModel = "codex/gpt-5.5"
 
@@ -52,6 +60,7 @@ var allowedOrigins = []string{
 var (
 	sessionStore *sessions.Store
 	threads      *threadMap
+	meter        *usageMeter
 	stats        = openai.NewStats()
 )
 
@@ -137,10 +146,15 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
 	sessionStore.LogRequest(req.SessionID, &req)
 
+	// Retry closure for the dead-thread signature (`codex exec resume` of a
+	// vanished rollout exits 1 with empty stdout): forget the binding and
+	// rebuild the input as a fresh session replaying full history.
+	rebuildFresh := newRebuildFresh(threads, &req, model, sessionDir)
+
 	if req.Stream {
-		handleStreamResponse(w, r, input, chatID, created, model, includeUsage, req.WorkingDir, req.EnvVars, req.SessionID)
+		handleStreamResponse(w, r, input, chatID, created, model, includeUsage, req.WorkingDir, req.EnvVars, req.SessionID, rebuildFresh)
 	} else {
-		handleNonStreamResponse(w, r, input, chatID, created, model, req.WorkingDir, req.EnvVars, req.SessionID)
+		handleNonStreamResponse(w, r, input, chatID, created, model, req.WorkingDir, req.EnvVars, req.SessionID, rebuildFresh)
 	}
 }
 
@@ -166,6 +180,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		"status":  "healthy",
 		"backend": "codex",
 		"version": version,
+		"commit":  buildCommit,
 	})
 }
 
@@ -222,6 +237,7 @@ func main() {
 	sessionStore = sessions.New(*sessionsDir)
 	sessionStore.StartCleanup(72*time.Hour, 1*time.Hour)
 	threads = newThreadMap(sessionStore.AbsDir())
+	meter = newUsageMeter(sessionStore.AbsDir())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", chatCompletionsHandler)

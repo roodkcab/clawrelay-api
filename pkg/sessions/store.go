@@ -272,29 +272,49 @@ func (s *Store) cleanupOldSessions(maxAge time.Duration) {
 		return
 	}
 	cutoff := time.Now().Add(-maxAge)
+
+	// Effective last-activity per session = the NEWEST mtime across the
+	// session's .jsonl log, its attachment/binding directory, and that
+	// directory's direct children.
+	//
+	// Why not the directory's own mtime (the old behavior): relay-codex writes
+	// codex_thread.txt into the session dir on the first turn, and bots that
+	// run with a working_dir never stage attachments here — so the directory's
+	// mtime can stay frozen at turn #1 for a session that is active every day.
+	// Judging age by the dir mtime alone deleted live thread bindings (and,
+	// because each branch removed BOTH artifacts, even a freshly-appended
+	// .jsonl), silently breaking `codex exec resume` for active sessions.
+	// (threadMap.Set now also rewrites codex_thread.txt every turn to refresh
+	// its mtime — the two fixes back each other up.)
+	latest := make(map[string]time.Time)
+	bump := func(id string, t time.Time) {
+		if cur, ok := latest[id]; !ok || t.After(cur) {
+			latest[id] = t
+		}
+	}
 	for _, e := range entries {
 		name := e.Name()
-		var sessionID string
-		var modTime time.Time
-
-		if e.IsDir() {
-			sessionID = name
-			info, err := e.Info()
-			if err != nil {
-				continue
-			}
-			modTime = info.ModTime()
-		} else if strings.HasSuffix(name, ".jsonl") {
-			sessionID = strings.TrimSuffix(name, ".jsonl")
-			info, err := e.Info()
-			if err != nil {
-				continue
-			}
-			modTime = info.ModTime()
-		} else {
+		info, err := e.Info()
+		if err != nil {
 			continue
 		}
+		if e.IsDir() {
+			bump(name, info.ModTime())
+			children, err := os.ReadDir(filepath.Join(s.Dir, name))
+			if err != nil {
+				continue
+			}
+			for _, c := range children {
+				if ci, err := c.Info(); err == nil {
+					bump(name, ci.ModTime())
+				}
+			}
+		} else if strings.HasSuffix(name, ".jsonl") {
+			bump(strings.TrimSuffix(name, ".jsonl"), info.ModTime())
+		}
+	}
 
+	for sessionID, modTime := range latest {
 		if modTime.After(cutoff) {
 			continue
 		}
