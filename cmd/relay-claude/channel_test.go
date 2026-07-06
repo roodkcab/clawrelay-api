@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -168,6 +169,111 @@ func TestAbandonWhileParkedNoPanic(t *testing.T) {
 	}
 }
 
+// ---- stdout scanner error → 不留僵尸 worker ----
+
+func TestDrainStdoutScannerErrorMarksDead(t *testing.T) {
+	w := &chanWorker{ready: make(chan struct{})}
+	a := &activeTurn{lines: make(chan string, 8), quit: make(chan struct{})}
+	w.cur = a
+
+	// 一行超过 8MB 的 scanner 上限 → sc.Scan() 返回 false 且 sc.Err() 非 nil。
+	// 修复前 drainStdout 静默退出且不标记 dead：进程还活着，后续 beginTurn 的
+	// dead 检查全过、写 stdin 成功，却永远无人读 stdout——僵尸 worker。
+	huge := strings.Repeat("x", 9*1024*1024) + "\n"
+
+	done := make(chan struct{})
+	go func() { w.drainStdout(strings.NewReader(huge)); close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("drainStdout did not exit on scanner error")
+	}
+	if !w.dead.Load() {
+		t.Fatal("scanner error must mark the worker dead")
+	}
+	for range a.lines { // 活跃 turn 必须被收尾（defer 关闭），handler 才能解除阻塞
+	}
+}
+
+// ---- Wait 与 pipe reader 的顺序 + reaped 防护 ----
+
+// spawnChanWorker 必须等 drainStdout/drainStderr 读完才 cmd.Wait()：stub 进程
+// 一次性突发 51 行后立即退出，若 Wait 与 reader 并发（os/exec 违规），Wait 关闭
+// stdout 管道会截断 reader 尚未读走的缓冲——尾部的 result 行最容易被截掉。
+func TestWaitAfterReadersNoTruncatedResult(t *testing.T) {
+	old := claudeBin
+	claudeBin = "sh"
+	defer func() { claudeBin = old }()
+
+	script := `read x; i=0; while [ $i -lt 50 ]; do echo '{"type":"stream_event"}'; i=$((i+1)); done; echo '{"type":"result"}'`
+	w, err := spawnChanWorker("wait-order", []string{"-c", script}, "", nil, "--session-id", nil)
+	if err != nil {
+		t.Fatalf("spawn stub: %v", err)
+	}
+	defer w.kill()
+
+	lines, err := w.beginTurn("go")
+	if err != nil {
+		t.Fatalf("beginTurn: %v", err)
+	}
+	var got []string
+	for l := range lines {
+		got = append(got, l)
+	}
+	w.endTurn()
+
+	if len(got) != 51 {
+		t.Fatalf("expected all 51 buffered lines to survive process exit, got %d", len(got))
+	}
+	if !strings.Contains(got[len(got)-1], `"type":"result"`) {
+		t.Fatalf("last line must be the result event, got %q", got[len(got)-1])
+	}
+	select {
+	case <-w.deadCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("wait goroutine did not finish after readers drained")
+	}
+	if !w.reaped.Load() {
+		t.Fatal("reaped must be set once cmd.Wait returned")
+	}
+}
+
+// reaped 置位后 kill() 不得再对进程组发信号（PID 可能已复用，裸 kill(-pid) 会
+// 误杀无关进程组），但 dead 标记与 abandon 活跃 turn 的语义必须保留。用一个
+// 活着的 sleep 进程做误杀探针：防护失效的话它会被 SIGKILL。
+func TestKillSkipsKillGroupWhenReaped(t *testing.T) {
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start sleep: %v", err)
+	}
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	defer func() { _ = cmd.Process.Kill(); <-waited }()
+
+	w := &chanWorker{ready: make(chan struct{}), cmd: cmd}
+	a := &activeTurn{lines: make(chan string, 1), quit: make(chan struct{})}
+	w.cur = a
+	w.reaped.Store(true) // 模拟 cmd.Wait() 已返回、PID 可能已复用
+
+	w.kill()
+
+	if !w.dead.Load() {
+		t.Fatal("kill on a reaped worker must still mark dead")
+	}
+	select {
+	case <-a.quit:
+	default:
+		t.Fatal("kill on a reaped worker must still abandon the active turn")
+	}
+	select {
+	case <-waited:
+		t.Fatal("kill() signalled the process despite reaped=true (PID-reuse hazard)")
+	case <-time.After(300 * time.Millisecond):
+		// 进程还活着：信号确实被跳过。
+	}
+}
+
 func TestReaperSkipsInTurnWorker(t *testing.T) {
 	m := newChanManager(chanManagerConfig{IdleTTL: time.Minute})
 	busy := newWorkerAt("busy", time.Now().Add(-2*time.Minute)) // stale lastUsed
@@ -217,6 +323,53 @@ func TestBeginTurnWritesUserEnvelope(t *testing.T) {
 	}
 }
 
+// The interrupt backstop is turn-scoped: a timer armed for turn T1 must NOT
+// kill the worker once a later turn T2 owns it (the T1-drains-at-the-boundary
+// vs T2-just-started race). killTurnSeq(oldSeq) must be a no-op that leaves T2's
+// active turn intact.
+func TestKillTurnSeqSkipsSucceedingTurn(t *testing.T) {
+	w := &chanWorker{stdin: &bufWriteCloser{}}
+
+	// Turn T1 begins → seq advances; the backstop would capture this.
+	if _, err := w.beginTurn("t1"); err != nil {
+		t.Fatalf("beginTurn t1: %v", err)
+	}
+	t1Seq := w.turnSeqNow()
+
+	// T1 ends and T2 begins on the same worker (seq advances again).
+	w.completeActiveTurn(w.cur)
+	w.endTurn()
+	if _, err := w.beginTurn("t2"); err != nil {
+		t.Fatalf("beginTurn t2: %v", err)
+	}
+	t2Turn := w.cur
+
+	// The stale T1 backstop fires now: it must not touch T2.
+	if w.killTurnSeq(t1Seq) {
+		t.Fatal("killTurnSeq(oldSeq) killed the worker during a later turn")
+	}
+	if w.dead.Load() {
+		t.Fatal("stale backstop marked a live worker dead")
+	}
+	if w.cur != t2Turn {
+		t.Fatal("stale backstop abandoned T2's active turn")
+	}
+	select {
+	case <-t2Turn.quit:
+		t.Fatal("stale backstop closed T2's quit channel")
+	default:
+	}
+
+	// The correctly-scoped backstop for T2 does fire.
+	if !w.killTurnSeq(w.turnSeqNow()) {
+		t.Fatal("killTurnSeq(currentSeq) must kill the stuck turn")
+	}
+	if !w.dead.Load() {
+		t.Fatal("current-turn backstop must mark the worker dead")
+	}
+	w.endTurn()
+}
+
 func TestInterruptWritesControlMessage(t *testing.T) {
 	buf := &bufWriteCloser{}
 	w := &chanWorker{stdin: buf}
@@ -249,6 +402,93 @@ func TestBeginTurnFailsIfDiedAfterWrite(t *testing.T) {
 		t.Fatal("turnMu must be released after a fast-fail")
 	}
 	w.turnMu.Unlock()
+}
+
+// ---- lockTurn / beginTurnLocked：排队请求的 ctx 感知获锁 ----
+
+func TestLockTurnCtxCancelDoesNotLeakLock(t *testing.T) {
+	w := &chanWorker{ready: make(chan struct{})}
+	w.turnMu.Lock() // 模拟一个在途 turn 占着锁
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- w.lockTurn(ctx) }()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("lockTurn returned %v while the lock is held", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("lockTurn must fail once ctx is cancelled")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("lockTurn did not return after ctx cancel")
+	}
+
+	// 在途 turn 结束：被放弃的等锁 goroutine 拿到锁后必须立刻归还，下一个
+	// lockTurn 才能成功（锁泄漏的话这里会超时）。
+	w.turnMu.Unlock()
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+	if err := w.lockTurn(ctx2); err != nil {
+		t.Fatalf("lockTurn after cancel+release should succeed, got %v", err)
+	}
+	w.turnMu.Unlock()
+}
+
+func TestBeginTurnLockedUnlocksOnError(t *testing.T) {
+	w := &chanWorker{stdin: &bufWriteCloser{}}
+	w.dead.Store(true)
+	w.turnMu.Lock()
+	if _, err := w.beginTurnLocked("x"); err == nil {
+		t.Fatal("beginTurnLocked should fail on a dead worker")
+	}
+	if !w.turnMu.TryLock() {
+		t.Fatal("beginTurnLocked must release turnMu on its error path")
+	}
+	w.turnMu.Unlock()
+}
+
+func TestLockTurnWithQueuedPingsEmitsComments(t *testing.T) {
+	old := channelQueuedPingInterval
+	channelQueuedPingInterval = 10 * time.Millisecond
+	defer func() { channelQueuedPingInterval = old }()
+
+	w := &chanWorker{ready: make(chan struct{})}
+	w.turnMu.Lock() // 前一个 turn 占着锁，本请求进入排队
+	defer w.turnMu.Unlock()
+
+	rec := httptest.NewRecorder()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := lockTurnWithQueuedPings(ctx, rec, rec, w); err == nil {
+		t.Fatal("expected ctx timeout while the lock is held")
+	}
+	if !strings.Contains(rec.Body.String(), ": queued") {
+		t.Fatalf("queued SSE comments must flow while waiting, body: %q", rec.Body.String())
+	}
+}
+
+// SSE 头已发出后的错误收尾：必须是 ⚠️ content delta + finish + [DONE]，
+// 上游才能把错误当普通回复展示而不是挂死。
+func TestChannelEmitErrClose(t *testing.T) {
+	rec := httptest.NewRecorder()
+	channelEmitErrClose(rec, rec, "chatcmpl-e", 1700000000, "haiku", "boom")
+	body := rec.Body.String()
+	if !strings.Contains(body, "⚠️ boom") {
+		t.Errorf("missing visible error delta:\n%s", body)
+	}
+	if !strings.Contains(body, `"finish_reason":"stop"`) {
+		t.Errorf("missing finish chunk:\n%s", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("missing [DONE] terminator:\n%s", body)
+	}
 }
 
 func TestStopKillsInflightWorkers(t *testing.T) {
@@ -358,6 +598,55 @@ func TestManagerOnWorkerDieRemoves(t *testing.T) {
 	m.onWorkerDie("d")
 	if _, ok := m.workers["d"]; ok {
 		t.Fatal("dead worker should be removed by onWorkerDie")
+	}
+}
+
+// ---- drop：V1 fall-through 不得杀断活跃 turn ----
+
+func TestDropBusyWorkerFailsOnCtxCancel(t *testing.T) {
+	m := newChanManager(chanManagerConfig{})
+	w := newWorkerAt("s1", time.Now())
+	w.turnMu.Lock() // 正在给另一个请求流式输出
+	m.workers["s1"] = w
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := m.drop(ctx, "s1"); err == nil {
+		t.Fatal("drop must fail when the turn lock is unavailable before ctx expires")
+	}
+	if w.Dead() {
+		t.Fatal("a busy worker must NOT be killed by a failed drop")
+	}
+	if _, ok := m.workers["s1"]; !ok {
+		t.Fatal("failed drop must leave the worker registered (reaper must still see it)")
+	}
+	w.turnMu.Unlock()
+}
+
+func TestDropIdleWorkerKillsAndRemoves(t *testing.T) {
+	m := newChanManager(chanManagerConfig{})
+	w := newWorkerAt("s1", time.Now())
+	m.workers["s1"] = w
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := m.drop(ctx, "s1"); err != nil {
+		t.Fatalf("drop of an idle worker should succeed, got %v", err)
+	}
+	if !w.Dead() {
+		t.Fatal("dropped worker must be killed")
+	}
+	if _, ok := m.workers["s1"]; ok {
+		t.Fatal("dropped worker must be removed from the registry")
+	}
+	if !w.turnMu.TryLock() {
+		t.Fatal("drop must release turnMu after the kill")
+	}
+	w.turnMu.Unlock()
+
+	// 没有 worker 的 session：no-op 成功，fall-through 照常进行。
+	if err := m.drop(context.Background(), "missing"); err != nil {
+		t.Fatalf("drop of an unknown session must be a no-op success, got %v", err)
 	}
 }
 

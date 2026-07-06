@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"regexp"
+	"strings"
 )
 
 // GenerateChatID returns a fresh `chatcmpl-<hex>` id of the form OpenAI uses.
@@ -51,13 +51,89 @@ func WriteError(w http.ResponseWriter, statusCode int, errType, message string) 
 	})
 }
 
-// envVarsLogRedactor masks env_vars values in log output, since they may
-// contain user-provided secrets.
-var envVarsLogRedactor = regexp.MustCompile(`"env_vars"\s*:\s*\{[^}]*\}`)
-
-// SanitizeEnvVarsInLog redacts env_vars before request bodies hit the log file.
+// SanitizeEnvVarsInLog redacts every env_vars object before request bodies
+// hit the log file, since the values may contain user-provided secrets. This
+// used to be a regex matching `\{[^}]*\}`, but a '}' inside a value ended the
+// match early and everything after it — including further secrets — leaked
+// into the log verbatim. So the object is now walked with a small string-aware
+// scanner that honors escapes and brace depth to find its real closing brace.
 func SanitizeEnvVarsInLog(body string) string {
-	return envVarsLogRedactor.ReplaceAllString(body, `"env_vars":"[REDACTED]"`)
+	const key = `"env_vars"`
+	var out strings.Builder
+	for {
+		idx := strings.Index(body, key)
+		if idx < 0 {
+			break
+		}
+		// Skip `"env_vars"` then optional whitespace, ':', whitespace, '{'.
+		// Anything else (e.g. an already-redacted string value) is copied
+		// through untouched and the search resumes after the key.
+		j := idx + len(key)
+		for j < len(body) && isJSONSpace(body[j]) {
+			j++
+		}
+		if j >= len(body) || body[j] != ':' {
+			out.WriteString(body[:j])
+			body = body[j:]
+			continue
+		}
+		j++
+		for j < len(body) && isJSONSpace(body[j]) {
+			j++
+		}
+		if j >= len(body) || body[j] != '{' {
+			out.WriteString(body[:j])
+			body = body[j:]
+			continue
+		}
+		end := scanJSONObjectEnd(body, j)
+		out.WriteString(body[:idx])
+		out.WriteString(`"env_vars":{"[REDACTED]":"..."}`)
+		body = body[end:]
+	}
+	if out.Len() == 0 {
+		return body
+	}
+	out.WriteString(body)
+	return out.String()
+}
+
+func isJSONSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+// scanJSONObjectEnd returns the index just past the '}' that closes the
+// object opening at body[start] ('{'). Braces inside string values don't
+// count, and `\"` / `\\` escapes are honored so a value can't fake a string
+// end. If the object never closes (truncated body), the whole tail is treated
+// as part of the object: over-redacting beats leaking.
+func scanJSONObjectEnd(body string, start int) int {
+	depth := 0
+	inStr := false
+	for i := start; i < len(body); i++ {
+		c := body[i]
+		if inStr {
+			switch c {
+			case '\\':
+				i++ // skip the escaped byte, whatever it is
+			case '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return len(body)
 }
 
 // Truncate returns at most maxLen characters of s, appending "..." if cut.

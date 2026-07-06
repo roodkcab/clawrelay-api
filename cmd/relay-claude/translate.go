@@ -309,6 +309,28 @@ func (t *sseTranslator) feed(w http.ResponseWriter, flusher http.Flusher, line s
 
 	if event.Type == "result" {
 		t.sawResult = true
+
+		// Error results (is_error / subtype=error_*) used to be
+		// indistinguishable from success downstream: extractTextFromEvent only
+		// reads assistant events, so the explanation claude puts in Result was
+		// silently dropped and the client saw an empty, cleanly-finished turn.
+		// Surface it as a content delta when nothing has been streamed yet.
+		// finish_reason stays "stop" — upstream (wuji) only accepts the
+		// standard OpenAI values.
+		if event.IsError || strings.HasPrefix(event.Subtype, "error") {
+			log.Printf("result reports error: subtype=%s is_error=%v chat=%s session=%s model=%s",
+				event.Subtype, event.IsError, t.chatID, t.sessionID, t.model)
+			if !t.streamDeltaSent && event.Result != "" {
+				t.emit(w, flusher, openai.ChatCompletionResponse{
+					ID: t.chatID, Object: "chat.completion.chunk", Created: t.created, Model: t.model,
+					Choices: []openai.ChatCompletionChoice{{
+						Index: 0,
+						Delta: openai.NewChatMessage("assistant", "⚠️ "+event.Result),
+					}},
+				})
+			}
+		}
+
 		if eu := effectiveUsage(&event); eu != nil {
 			if _, isIdentity := t.meter.(identityMeter); isIdentity {
 				// V1 / ephemeral (one process per turn): the result figures ARE

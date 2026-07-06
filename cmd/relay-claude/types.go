@@ -15,8 +15,12 @@ type claudeEvent struct {
 	Subtype string          `json:"subtype,omitempty"`
 	Message json.RawMessage `json:"message,omitempty"`
 	Event   json.RawMessage `json:"event,omitempty"` // for stream_event wrapper
-	Result  string          `json:"result,omitempty"`
-	Usage   *claudeUsage    `json:"usage,omitempty"`
+	// IsError marks a failed result (paired with subtype error_max_turns /
+	// error_during_execution); Result then carries the error explanation
+	// instead of the final assistant text.
+	IsError bool         `json:"is_error,omitempty"`
+	Result  string       `json:"result,omitempty"`
+	Usage   *claudeUsage `json:"usage,omitempty"`
 	// ModelUsage rolls up sub-agent (Task tool) tokens; when present, prefer
 	// it over Usage which only counts the main agent.
 	ModelUsage   map[string]claudeModelUsage `json:"modelUsage,omitempty"`

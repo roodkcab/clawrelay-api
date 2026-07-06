@@ -28,7 +28,16 @@ const log = (...a: any[]) => {
 }
 log('STARTED RELAY_CTRL=' + CTRL + ' RELAY_SESSION=' + SID)
 
-process.on('uncaughtException', (e) => log('uncaughtException', String(e)))
+// uncaughtException: log loudly, then EXIT. A half-dead bridge that keeps
+// consuming /v3/next while its internals are broken silently eats messages —
+// strictly worse than dying outright: claude sees the MCP server exit, and the
+// relay-side watchdog restarts the session.
+process.on('uncaughtException', (e) => {
+  log('uncaughtException — exiting', String(e))
+  process.exit(1)
+})
+// unhandledRejection stays log-only ON PURPOSE (asymmetric with the above):
+// stray fetch rejections are routine here and not worth killing the bridge for.
 process.on('unhandledRejection', (e) => log('unhandledRejection', String(e)))
 
 if (!CTRL || !SID) {
@@ -131,23 +140,69 @@ const TOOL_PATHS: Record<string, string> = {
 // until claude calls `reply` for it before pulling the next. Two messages must
 // never sit in the single interactive session at once — that confuses and can
 // HANG claude (observed: a rapid 2nd message stalls both turns for ~20min).
-const replyWaiters = new Map<string, () => void>()
+//
+// Fallback semantics (activity-aware, matching the relay's activity-reset idle
+// timeout): the pump is released after 20min of SILENCE on the req_id — each
+// progress/reply_chunk/reply tool call resets the window via touchActivity() —
+// or after an absolute 2h cap, whichever fires first. A fixed 20min deadline
+// here used to fire mid-task on long jobs (claude posting progress every
+// minute, relay still happily waiting) and hard-inject the next message into a
+// busy claude — exactly the double-message hang this serialization prevents.
+type ReplyWaiter = { fin: () => void; silenceTimer: ReturnType<typeof setTimeout>; silenceMs: number }
+const replyWaiters = new Map<string, ReplyWaiter>()
 function signalReplyDone(reqId: string) {
   const w = replyWaiters.get(reqId)
-  if (w) w()
+  if (w) w.fin()
 }
-function waitForReplyDone(reqId: string, timeoutMs: number): Promise<void> {
+// Claude showed a sign of life on this req_id — push the silence fallback out.
+function touchActivity(reqId: string) {
+  const w = replyWaiters.get(reqId)
+  if (!w) return
+  clearTimeout(w.silenceTimer)
+  w.silenceTimer = setTimeout(w.fin, w.silenceMs)
+}
+function waitForReplyDone(reqId: string, silenceMs: number, absoluteMs: number): Promise<void> {
   return new Promise<void>((resolve) => {
     let settled = false
+    let absTimer: ReturnType<typeof setTimeout> | undefined
     const fin = () => {
       if (settled) return
       settled = true
+      const w = replyWaiters.get(reqId)
+      if (w) clearTimeout(w.silenceTimer)
       replyWaiters.delete(reqId)
+      if (absTimer) clearTimeout(absTimer)
       resolve()
     }
-    replyWaiters.set(reqId, fin)
-    setTimeout(fin, timeoutMs) // fallback: never block the pump forever
+    replyWaiters.set(reqId, { fin, silenceTimer: setTimeout(fin, silenceMs), silenceMs })
+    absTimer = setTimeout(fin, absoluteMs)
   })
+}
+
+// Forward one tool call to the relay. Every attempt carries a 15s timeout so a
+// wedged relay can never hang claude's MCP tool call forever. `reply` is the
+// terminal state — losing it leaves the frontend waiting for the full 20min
+// idle timeout — so it gets up to 3 retries with 1s/2s/4s backoff; progress and
+// reply_chunk are non-terminal and tolerable to drop, so they retry just once.
+async function postToRelay(name: string, path: string, body: { req_id: string; text: string }): Promise<boolean> {
+  const retries = name === 'reply' ? 3 : 1
+  const backoffs = [1_000, 2_000, 4_000]
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const r = await fetch(CTRL + path + '?session=' + encodeURIComponent(SID), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15_000),
+      })
+      if (r.ok) return true
+      log(name + ' POST non-ok', r.status, 'attempt ' + (attempt + 1) + '/' + (retries + 1))
+    } catch (e) {
+      log(name + ' POST failed', String(e), 'attempt ' + (attempt + 1) + '/' + (retries + 1))
+    }
+    if (attempt < retries) await new Promise((res) => setTimeout(res, backoffs[attempt] ?? 4_000))
+  }
+  return false
 }
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -156,19 +211,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (path) {
     const { req_id, text } = (req.params.arguments ?? {}) as { req_id: string; text: string }
     log(name, 'req_id=', req_id, 'len=', (text ?? '').length)
-    try {
-      const r = await fetch(CTRL + path + '?session=' + encodeURIComponent(SID), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ req_id, text }),
-      })
-      if (!r.ok) log(name + ' POST non-ok', r.status)
-    } catch (e) {
-      log(name + ' POST failed', e)
+    // Any tool call on this req_id is a sign of life — reset its silence fallback.
+    touchActivity(String(req_id))
+    const delivered = await postToRelay(name, path, { req_id, text })
+    if (!delivered && name === 'reply') {
+      // Loud marker: the terminal reply never reached the relay. We STILL
+      // return success to claude (the relay is dead/wedged — an error here is
+      // useless and can provoke duplicate reply attempts) and STILL release
+      // the pump below, so the bridge itself never wedges.
+      log('REPLY DELIVERY FAILED req_id=' + req_id + ' after all retries; returning success to claude anyway')
     }
     // A terminal reply means claude finished this message — release pumpInbound
     // to inject the next queued message (strict one-at-a-time serialization).
-    if (name === 'reply') signalReplyDone(req_id)
+    if (name === 'reply') signalReplyDone(String(req_id))
     return { content: [{ type: 'text', text: name === 'reply' ? 'delivered' : 'ok' }] }
   }
   throw new Error('unknown tool: ' + req.params.name)
@@ -201,15 +256,36 @@ async function pumpInbound() {
       }
       const msg = (await r.json()) as { req_id: string; content: string }
       log('inbound req_id=' + msg.req_id + ' len=' + (msg.content ?? '').length)
-      await mcp.notification({
-        method: 'notifications/claude/channel',
-        params: { content: msg.content, meta: { req_id: String(msg.req_id) } },
-      })
+      // The message is already consumed from the relay inbox — if injection
+      // fails it is lost for good (the relay-side cold-start watchdog takes
+      // ~5min to recover). So retry the notification itself, separately from
+      // the outer catch: up to 5 attempts 1s apart, covering an MCP transport
+      // that is not connected yet or a transient stdio write failure.
+      let injected = false
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+          await mcp.notification({
+            method: 'notifications/claude/channel',
+            params: { content: msg.content, meta: { req_id: String(msg.req_id) } },
+          })
+          injected = true
+          break
+        } catch (e: any) {
+          log('inject attempt ' + attempt + '/5 failed req_id=' + msg.req_id + ' ' + (e?.message ?? String(e)))
+          if (attempt < 5) await new Promise((res) => setTimeout(res, 1000))
+        }
+      }
+      if (!injected) {
+        log('MESSAGE INJECTION FAILED req_id=' + msg.req_id + ' — giving up after 5 attempts, message lost')
+        continue
+      }
       log('injected req_id=' + msg.req_id)
       // Serialize: wait until claude finishes THIS message (calls `reply`) before
       // pulling the next, so the single TUI never holds two messages at once.
-      // 20min fallback matches the relay's idle-timeout (never block forever).
-      await waitForReplyDone(String(msg.req_id), 20 * 60_000)
+      // Fallback: released after 20min of SILENCE (in sync with the relay's
+      // activity-reset idle timeout; progress/reply_chunk/reply reset it) or an
+      // absolute 2h cap — whichever comes first. Never blocks forever.
+      await waitForReplyDone(String(msg.req_id), 20 * 60_000, 2 * 60 * 60_000)
       log('done req_id=' + msg.req_id + '; ready for next')
     } catch (e: any) {
       if (e?.name === 'TimeoutError') continue
@@ -219,12 +295,15 @@ async function pumpInbound() {
   }
 }
 
-// Start polling immediately (does not depend on the MCP handshake completing).
-pumpInbound()
-
 try {
   await mcp.connect(new StdioServerTransport())
   log('MCP connected')
+  // Start polling only once the transport is up: the relay waits for the PTY
+  // readiness marker before enqueueing the first message anyway, so polling
+  // earlier gains nothing and only widens the not-yet-connected window where
+  // an injected notification would fail.
+  pumpInbound()
 } catch (e) {
-  log('mcp.connect FAILED ' + String(e))
+  log('mcp.connect FAILED ' + String(e) + ' — starting pumpInbound anyway as a last resort, so inbound messages are not completely stranded even after a broken MCP handshake')
+  pumpInbound()
 }

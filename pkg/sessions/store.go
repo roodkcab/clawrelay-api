@@ -23,12 +23,46 @@ type Event struct {
 	Data      json.RawMessage `json:"data"`
 }
 
+// maxBufferedEvents caps the in-memory event history per session. Long-lived
+// sessions (a busy group chat can keep one session_id for weeks) would
+// otherwise grow events without bound and take the process RSS with them. The
+// on-disk .jsonl keeps the complete history; trimming only shortens the
+// backlog the viewer replays.
+const maxBufferedEvents = 4000
+
 // Entry holds one session's in-memory state plus its log file handle.
 type Entry struct {
 	mu          sync.Mutex
 	events      []Event
 	subscribers map[chan Event]struct{}
 	logFile     *os.File
+	// closed is set by cleanup after the log file is closed and the entry is
+	// removed from the store; in-flight handlers may still hold the pointer,
+	// so Append must become a no-op instead of writing a dead fd or growing
+	// an unreachable events slice.
+	closed bool
+}
+
+// trimLocked drops the oldest half of the buffer once it exceeds the cap,
+// leaving a marker event in its place so the viewer shows where history was
+// cut instead of silently starting mid-conversation. Caller must hold e.mu.
+func (e *Entry) trimLocked() {
+	if len(e.events) <= maxBufferedEvents {
+		return
+	}
+	drop := len(e.events) / 2
+	data, _ := json.Marshal(map[string]int{"dropped": drop})
+	marker := Event{
+		Timestamp: time.Now().Format(time.RFC3339Nano),
+		Type:      "truncated",
+		Data:      data,
+	}
+	// Copy into a fresh slice: re-slicing would keep the old backing array
+	// (and every dropped Event's Data) reachable, defeating the trim.
+	kept := make([]Event, 0, len(e.events)-drop+1)
+	kept = append(kept, marker)
+	kept = append(kept, e.events[drop:]...)
+	e.events = kept
 }
 
 // Store is the global registry of all known sessions for one relay binary.
@@ -94,6 +128,8 @@ func (s *Store) GetOrCreate(sessionID string) *Entry {
 				entry.events = append(entry.events, ev)
 			}
 		}
+		// A weeks-old session can hydrate far past the cap in one go.
+		entry.trimLocked()
 	}
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
@@ -116,7 +152,12 @@ func (s *Store) Get(sessionID string) *Entry {
 // fans it out to live WebSocket subscribers.
 func (e *Entry) Append(ev Event) {
 	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return
+	}
 	e.events = append(e.events, ev)
+	e.trimLocked()
 
 	if e.logFile != nil {
 		if data, err := json.Marshal(ev); err == nil {
@@ -319,6 +360,24 @@ func (s *Store) cleanupOldSessions(maxAge time.Duration) {
 			continue
 		}
 
+		// Detach the in-memory entry BEFORE unlinking anything: the previous
+		// order (unlink first, close later) left a window where an in-flight
+		// handler still holding the *Entry kept appending through an fd whose
+		// file was already deleted. Marking the entry closed makes those late
+		// Appends safe no-ops.
+		s.mu.Lock()
+		if entry, ok := s.sessions[sessionID]; ok {
+			entry.mu.Lock()
+			entry.closed = true
+			if entry.logFile != nil {
+				entry.logFile.Close()
+				entry.logFile = nil
+			}
+			entry.mu.Unlock()
+			delete(s.sessions, sessionID)
+		}
+		s.mu.Unlock()
+
 		logPath := filepath.Join(s.Dir, sessionID+".jsonl")
 		if err := os.Remove(logPath); err != nil && !os.IsNotExist(err) {
 			log.Printf("session cleanup: failed to remove %s: %v", logPath, err)
@@ -327,17 +386,6 @@ func (s *Store) cleanupOldSessions(maxAge time.Duration) {
 		if err := os.RemoveAll(filesDir); err != nil {
 			log.Printf("session cleanup: failed to remove %s: %v", filesDir, err)
 		}
-
-		s.mu.Lock()
-		if entry, ok := s.sessions[sessionID]; ok {
-			entry.mu.Lock()
-			if entry.logFile != nil {
-				entry.logFile.Close()
-			}
-			entry.mu.Unlock()
-			delete(s.sessions, sessionID)
-		}
-		s.mu.Unlock()
 
 		log.Printf("session cleanup: removed expired session %s (last modified: %s)", sessionID, modTime.Format(time.RFC3339))
 	}
