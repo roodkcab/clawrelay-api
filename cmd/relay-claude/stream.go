@@ -13,6 +13,11 @@ import (
 	"clawrelay-api/pkg/proc"
 )
 
+// heartbeatInterval paces the SSE comment heartbeats (`: keepalive`) that keep
+// idle-timeout proxies and clients from cutting a quiet stream. Package var so
+// tests can shorten it.
+var heartbeatInterval = 30 * time.Second
+
 // abortClaudeAndHarvestUsage 中断 V1 进程并在后台限时收割该轮 usage：
 // SIGINT → 最多 10s 内解析残余行中的 result（modelUsage 有真实值）→
 // stats.RecordTurn 记账（+日志）→ KillGroup 兜底 + 排空。
@@ -61,44 +66,99 @@ func abortClaudeAndHarvestUsage(cmd *exec.Cmd, lines <-chan string, model, sessi
 	}()
 }
 
-// handleStreamResponse streams Claude output without tool-call detection.
-// Used when no tools are defined in the request (fast path). The stream-json →
-// OpenAI SSE translation is delegated to sseTranslator (shared with the
-// channel-mode handler); this function owns only the per-request process
-// lifecycle, heartbeats and disconnect handling.
-func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt, chatID string, created int64, model string, includeUsage bool, workingDir string, envVars map[string]string, sessionID string) {
-	lines, ready, cmdPtr := startClaudeStream(args, prompt, workingDir, envVars)
-	if err := <-ready; err != nil {
-		openai.WriteError(w, http.StatusInternalServerError, "server_error", err.Error())
-		return
+// sseHandshake sends the SSE response headers and the first `: ping` BEFORE
+// claude is ready. ready waits for the CLI's first stdout line (the resume
+// sniff path even runs a whole first process), so a slow-starting or hung CLI
+// used to leave the client with zero bytes — not even response headers — until
+// its read timeout cut the connection (wuji-tools: sock_read=120s →
+// "AI 连接出现错误"). Same approach as the V2 channel handler.
+//
+// Returns ok=false after cleaning up when streaming is unsupported. Once this
+// returns ok=true the status code is out: every later failure must close the
+// stream with an in-stream error chunk, not an HTTP error.
+func sseHandshake(w http.ResponseWriter, ready <-chan error, handle *procHandle, lines <-chan string) (http.Flusher, *time.Ticker, bool) {
+	flusher, isFlusher := w.(http.Flusher)
+	if !isFlusher {
+		// 部署/中间件问题：没有 flusher 做不了 SSE。头还没发，用标准 500，
+		// 后台等进程起来后杀掉排空。
+		log.Printf("Streaming not supported")
+		openai.WriteError(w, http.StatusInternalServerError, "server_error", "streaming unsupported by this connection")
+		go func() {
+			if err := <-ready; err == nil {
+				if cmd := handle.abort(); cmd != nil {
+					proc.KillGroup(cmd)
+				}
+			}
+			proc.DrainLines(lines)
+		}()
+		return nil, nil, false
 	}
-
-	// Disconnect handling is inline in the loop below (single goroutine
-	// watching ctx), so there is no watcher/loop race on ctx.
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		// 非用户中断（本地 ResponseWriter 不支持 flush，属于部署/中间件问题），
-		// 不做 SIGINT 收割：直接杀掉并排空即可。
-		log.Printf("Streaming not supported")
-		if cmd := *cmdPtr; cmd != nil {
-			proc.KillGroup(cmd)
-		}
-		proc.DrainLines(lines)
-		return
-	}
-
 	fmt.Fprintf(w, ": ping\n\n")
 	flusher.Flush()
 
-	heartbeatTicker := time.NewTicker(30 * time.Second)
+	return flusher, time.NewTicker(heartbeatInterval), true
+}
+
+// waitClaudeReady blocks until startClaudeStream's ready fires, keeping the
+// (already-started) SSE stream alive with comment heartbeats and honoring
+// client disconnects. Startup failures — fork error, zero-output crash,
+// first-line watchdog kill, failed resume retry — are emitted as a visible
+// in-stream error chunk + [DONE] (the status code is long gone), so the
+// upstream client renders the reason instead of an empty reply or a timeout.
+// Returns false when the handler must stop (error emitted or client gone).
+func waitClaudeReady(w http.ResponseWriter, r *http.Request, flusher http.Flusher, heartbeatTicker *time.Ticker, ready <-chan error, handle *procHandle, lines <-chan string, chatID string, created int64, model, sessionID string) bool {
+	for {
+		select {
+		case err := <-ready:
+			if err != nil {
+				log.Printf("claude startup failed: chat=%s session=%s: %v", chatID, sessionID, err)
+				channelEmitErrClose(w, flusher, chatID, created, model, err.Error())
+				proc.DrainLines(lines)
+				return false
+			}
+			return true
+		case <-heartbeatTicker.C:
+			fmt.Fprintf(w, ": keepalive\n\n")
+			flusher.Flush()
+		case <-r.Context().Done():
+			// Client gone while claude was still starting: same treatment as a
+			// mid-stream disconnect.
+			if cmd := handle.abort(); cmd != nil {
+				abortClaudeAndHarvestUsage(cmd, lines, model, sessionID)
+			} else {
+				proc.DrainLines(lines)
+			}
+			return false
+		}
+	}
+}
+
+// handleStreamResponse streams Claude output without tool-call detection.
+// Used when no tools are defined in the request (fast path). The stream-json →
+// OpenAI SSE translation is delegated to sseTranslator (shared with the
+// channel-mode handler); this function owns only the per-request process
+// lifecycle, heartbeats and disconnect handling.
+func handleStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt, chatID string, created int64, model string, includeUsage bool, workingDir string, envVars map[string]string, sessionID string) {
+	lines, ready, handle := startClaudeStream(args, prompt, workingDir, envVars)
+
+	flusher, heartbeatTicker, ok := sseHandshake(w, ready, handle, lines)
+	if !ok {
+		return
+	}
 	defer heartbeatTicker.Stop()
+
+	// Disconnect handling is inline in the loops below (single goroutine
+	// watching ctx), so there is no watcher/loop race on ctx.
+
+	if !waitClaudeReady(w, r, flusher, heartbeatTicker, ready, handle, lines, chatID, created, model, sessionID) {
+		return
+	}
 
 	t := newSSETranslator(chatID, created, model, sessionID, identityMeter{}, "")
 
@@ -110,7 +170,7 @@ processLines:
 		case <-r.Context().Done():
 			// disconnect (= upstream stop): SIGINT + harvest the aborted turn's
 			// usage before the backstop kill (A3).
-			if cmd := *cmdPtr; cmd != nil {
+			if cmd := handle.abort(); cmd != nil {
 				abortClaudeAndHarvestUsage(cmd, lines, model, sessionID)
 			} else {
 				proc.DrainLines(lines)
@@ -130,7 +190,7 @@ processLines:
 		}
 
 		if t.feed(w, flusher, line, includeUsage) == outcomeAskUserDone {
-			if cmd := *cmdPtr; cmd != nil && cmd.Process != nil {
+			if cmd := handle.abort(); cmd != nil && cmd.Process != nil {
 				log.Printf("[ASK_USER_QUESTION] interrupting Claude process group pid=%d (usage harvest, then kill)", cmd.Process.Pid)
 				abortClaudeAndHarvestUsage(cmd, lines, model, sessionID)
 			} else {
@@ -154,37 +214,20 @@ processLines:
 // collecting full output text to detect tool calls at the end. Used when
 // tools are defined in the request.
 func handleBufferedStreamResponse(w http.ResponseWriter, r *http.Request, args []string, prompt, chatID string, created int64, model string, includeUsage bool, workingDir string, envVars map[string]string, sessionID string) {
-	lines, ready, cmdPtr := startClaudeStream(args, prompt, workingDir, envVars)
-	if err := <-ready; err != nil {
-		openai.WriteError(w, http.StatusInternalServerError, "server_error", err.Error())
+	lines, ready, handle := startClaudeStream(args, prompt, workingDir, envVars)
+
+	flusher, heartbeatTicker, ok := sseHandshake(w, ready, handle, lines)
+	if !ok {
 		return
 	}
+	defer heartbeatTicker.Stop()
 
-	// Disconnect handling is inline in the loop below (single goroutine
+	// Disconnect handling is inline in the loops below (single goroutine
 	// watching ctx), so there is no watcher/loop race on ctx.
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		// 非用户中断（flush 不可用），不做 SIGINT 收割：直接杀掉并排空。
-		log.Printf("Streaming not supported")
-		if cmd := *cmdPtr; cmd != nil {
-			proc.KillGroup(cmd)
-		}
-		proc.DrainLines(lines)
+	if !waitClaudeReady(w, r, flusher, heartbeatTicker, ready, handle, lines, chatID, created, model, sessionID) {
 		return
 	}
-
-	fmt.Fprintf(w, ": ping\n\n")
-	flusher.Flush()
-
-	heartbeatTicker := time.NewTicker(30 * time.Second)
-	defer heartbeatTicker.Stop()
 
 	var fullText strings.Builder
 	var filter toolCallFilter
@@ -203,7 +246,7 @@ processLines:
 		case <-r.Context().Done():
 			// disconnect (= upstream stop): SIGINT + harvest the aborted turn's
 			// usage before the backstop kill (A3).
-			if cmd := *cmdPtr; cmd != nil {
+			if cmd := handle.abort(); cmd != nil {
 				abortClaudeAndHarvestUsage(cmd, lines, model, sessionID)
 			} else {
 				proc.DrainLines(lines)
@@ -299,7 +342,7 @@ processLines:
 					fmt.Fprintf(w, "data: [DONE]\n\n")
 					flusher.Flush()
 
-					if cmd := *cmdPtr; cmd != nil && cmd.Process != nil {
+					if cmd := handle.abort(); cmd != nil && cmd.Process != nil {
 						log.Printf("[ASK_USER_QUESTION] interrupting Claude process group pid=%d (usage harvest, then kill)", cmd.Process.Pid)
 						abortClaudeAndHarvestUsage(cmd, lines, model, sessionID)
 					} else {
@@ -373,6 +416,25 @@ processLines:
 		}
 
 		if event.Type == "result" {
+			// Mirror translate.go's error transparency: an error result whose
+			// explanation only lives in Result (nothing streamed yet) must be
+			// surfaced as a content delta, or the turn ends cleanly but empty —
+			// this path is hit by resume-sniff-forwarded error results too.
+			if (event.IsError || strings.HasPrefix(event.Subtype, "error")) && !streamDeltaSent && event.Result != "" {
+				log.Printf("result reports error (buffered path): subtype=%s is_error=%v chat=%s session=%s",
+					event.Subtype, event.IsError, chatID, sessionID)
+				chunk := openai.ChatCompletionResponse{
+					ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
+					Choices: []openai.ChatCompletionChoice{{
+						Index: 0,
+						Delta: openai.NewChatMessage("assistant", "⚠️ "+event.Result),
+					}},
+					XRelayError: true,
+				}
+				data, _ := json.Marshal(chunk)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+			}
 			if event.Result != "" {
 				fullText.Reset()
 				fullText.WriteString(event.Result)

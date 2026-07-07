@@ -38,7 +38,8 @@ var channelQueuedPingInterval = 15 * time.Second
 func channelEmitErrClose(w http.ResponseWriter, flusher http.Flusher, chatID string, created int64, model, msg string) {
 	chunk := openai.ChatCompletionResponse{
 		ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
-		Choices: []openai.ChatCompletionChoice{{Index: 0, Delta: openai.NewChatMessage("assistant", "⚠️ "+msg)}},
+		Choices:     []openai.ChatCompletionChoice{{Index: 0, Delta: openai.NewChatMessage("assistant", "⚠️ "+msg)}},
+		XRelayError: true,
 	}
 	data, _ := json.Marshal(chunk)
 	fmt.Fprintf(w, "data: %s\n\n", data)
@@ -46,7 +47,8 @@ func channelEmitErrClose(w http.ResponseWriter, flusher http.Flusher, chatID str
 	finish := "stop"
 	fin := openai.ChatCompletionResponse{
 		ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
-		Choices: []openai.ChatCompletionChoice{{Index: 0, Delta: openai.NewChatMessage("", ""), FinishReason: &finish}},
+		Choices:     []openai.ChatCompletionChoice{{Index: 0, Delta: openai.NewChatMessage("", ""), FinishReason: &finish}},
+		XRelayError: true,
 	}
 	data, _ = json.Marshal(fin)
 	fmt.Fprintf(w, "data: %s\n\n", data)

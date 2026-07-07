@@ -327,6 +327,7 @@ func (t *sseTranslator) feed(w http.ResponseWriter, flusher http.Flusher, line s
 						Index: 0,
 						Delta: openai.NewChatMessage("assistant", "⚠️ "+event.Result),
 					}},
+					XRelayError: true,
 				})
 			}
 		}
