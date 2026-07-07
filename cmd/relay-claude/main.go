@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -25,7 +26,7 @@ import (
 	"clawrelay-api/pkg/sessions"
 )
 
-var version = "2.1.0"
+var version = "2.2.0"
 
 // buildCommit is stamped at build time via:
 //
@@ -306,6 +307,15 @@ func main() {
 	if *model != "" {
 		defaultModel = *model
 		log.Printf("Default model set to: %s", defaultModel)
+	}
+
+	if v := os.Getenv("RELAY_FIRST_LINE_TIMEOUT_SECS"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+			firstLineTimeout = time.Duration(secs) * time.Second
+			log.Printf("first-line watchdog timeout set to %s (RELAY_FIRST_LINE_TIMEOUT_SECS)", firstLineTimeout)
+		} else {
+			log.Printf("ignoring invalid RELAY_FIRST_LINE_TIMEOUT_SECS=%q", v)
+		}
 	}
 
 	if *proxy != "" {

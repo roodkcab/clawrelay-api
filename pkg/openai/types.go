@@ -114,6 +114,13 @@ type ChatCompletionResponse struct {
 	Model   string                 `json:"model"`
 	Choices []ChatCompletionChoice `json:"choices"`
 	Usage   *UsageInfo             `json:"usage,omitempty"`
+	// XRelayError marks chunks whose content is a relay-generated error
+	// message (startup failure, worker crash) rather than model output. The
+	// stream still finishes with the standard finish_reason="stop" for OpenAI
+	// client compatibility; downstreams that know this extension (wuji-tools)
+	// can log the turn as an error instead of a success, while unknown clients
+	// simply ignore the field.
+	XRelayError bool `json:"x_relay_error,omitempty"`
 }
 
 type ChatCompletionChoice struct {
